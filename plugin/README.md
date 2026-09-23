@@ -1,34 +1,40 @@
-# Model Routing for Codex
+# Codex 模型路由插件
 
-Installable Codex plugin that packages a task-aware model routing policy and Luna, Sol, and Astra worker profiles. The skill explains when to use each tier and how to delegate using Codex native agents.
+此插件为 Codex 提供按任务风险和复杂度选择模型的路由策略，以及 Luna、Sol、Astra 三个 Worker 配置。技能还说明了如何使用 Codex 原生 Agent 委派任务。
 
-## One-command install
+## 一键安装
 
-From this directory:
+在仓库的 `plugin/` 目录运行：
 
 ```bash
 bash install.sh
 ```
 
-The script registers this directory as a local Codex plugin marketplace, installs `model-routing`, and copies the three worker profiles into `~/.codex/agents/`. Existing profiles with the same names are backed up before replacement. It does not replace `~/.codex/AGENTS.md`; the installed skill is the portable policy source. Start a new Codex task after installation.
+安装脚本会将当前目录注册为本地 Codex 插件市场、安装 `model-routing` 技能，并把三个 Worker 配置复制到 `~/.codex/agents/`。如果同名配置已存在，脚本会先备份再替换。安装不会覆盖 `~/.codex/AGENTS.md` 或其它 Codex 配置。完成后请新开一个 Codex 任务以加载技能和配置。
 
-## Manual marketplace install
+## 手动安装
 
 ```bash
-codex plugin marketplace add /absolute/path/to/codex-model-routing/plugin
+codex plugin marketplace add /绝对路径/codex-model-routing/plugin
 codex plugin add model-routing@model-routing
 ```
 
-Use `$model-routing` to invoke the routing skill explicitly. Codex can also discover it when a request concerns model choice or delegation.
+需要显式启用路由技能时，在 Codex 中使用 `$model-routing`。
 
-## Uninstall
+## 卸载
 
 ```bash
 bash uninstall.sh
 ```
 
-Uninstall removes the plugin and marketplace registration and restores worker files backed up by the installer. If a worker file did not exist before installation, it is removed. Backups are kept under `~/.codex/backups/model-routing-plugin-<timestamp>/`.
+卸载会移除插件和插件市场，并还原安装前的 Worker 配置。安装前不存在的 Worker 文件会被删除。备份保存在 `~/.codex/backups/model-routing-plugin-<时间戳>/`。
 
-## Scope and compatibility
+## 使用说明
 
-This plugin provides policy and worker profiles; it does not force the root model, alter active sessions, or create model availability. Worker model IDs must be supported by the user's Codex runtime. Install/upgrade and then start a new task for Codex to load the profiles and worker settings.
+| 层级 | 模型 | 适用范围 |
+| --- | --- | --- |
+| Astra | `gpt-6-astra` | 明确指定 Astra，或有充分依据需要最高能力处理的极复杂任务 |
+| Sol | `gpt-6-sol` | 架构、根因不明、高风险、并发/分布式、安全敏感及深度性能诊断 |
+| Luna | `gpt-6-luna` | 常规开发、重构、测试设计、中等复杂度排障和边界清楚的修改 |
+
+Worker 模型是否可用取决于当前 Codex 运行环境。插件提供路由策略和 Worker 默认配置，不会强制改变 Root 模型，也不会切换正在运行的会话。
