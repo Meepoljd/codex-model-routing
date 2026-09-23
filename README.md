@@ -1,8 +1,21 @@
-# Codex Model Routing
+# Codex 模型路由插件
 
-## Recommended: install the Codex plugin
+本仓库提供一套可安装的 Codex 模型路由插件，按任务类型、风险、耦合度和根因不确定性选择合适的模型，并通过 Codex 原生 Agent 委派工作。
 
-The current portable package is in [`plugin/`](plugin/). It implements the current Astra → Sol → Luna routing policy and native worker profiles.
+## 路由策略
+
+按以下顺序评估；高风险规则优先于低成本规则。
+
+| 层级 | 模型与 Agent | 适用任务 |
+| --- | --- | --- |
+| Astra | `gpt-6-astra` · `astra_worker` | 用户明确要求 GPT-6 Astra；极复杂的端到端任务；多个架构问题相互影响；有证据表明 Sol 多次未能解决；或跨系统复杂度和失败代价高到 Sol 难以胜任 |
+| Sol | `gpt-6-sol` · `sol_worker` | 架构决策、根因不明、高风险或高耦合任务、并发与分布式问题、安全敏感设计、深度性能诊断、破坏性迁移，或 Luna 多次尝试失败 |
+| Luna | `gpt-6-luna` · `luna_worker` | 常规开发、多文件功能和重构、API 或数据模型调整、测试设计、中等复杂度排障及边界明确的配置修改 |
+| Root | `gpt-6-luna` · `low` | 理解需求、轻量搜索、简单总结和低风险规划；较大的实现任务委派给对应 Worker |
+
+不要根据提示长度、文件数量或模型新旧决定升级。通用的 GPT-6 请求按任务类型路由至 Sol 或 Luna；只有明确指定 GPT-6 Astra 才直接选择 Astra。安全、架构和并发任务通常由 Sol 处理。
+
+## 一键安装
 
 ```bash
 git clone git@github.com:Meepoljd/codex-model-routing.git
@@ -10,68 +23,16 @@ cd codex-model-routing/plugin
 bash install.sh
 ```
 
-The installer registers this directory as a local plugin marketplace, installs the `model-routing` skill, and backs up/replaces the three worker profiles in `~/.codex/agents/`. It leaves `~/.codex/AGENTS.md` and unrelated Codex configuration untouched. Start a new Codex task after installation. See [`plugin/README.md`](plugin/README.md) for manual setup and uninstall steps.
+安装脚本会将 `plugin/` 注册为本地 Codex 插件市场、安装 `model-routing` 技能，并把三个 Worker 配置安装到 `~/.codex/agents/`。替换同名配置前会备份原文件。脚本不会覆盖 `~/.codex/AGENTS.md` 或其它 Codex 配置。
 
-## Legacy standalone configuration installer
+安装后新开一个 Codex 任务以加载技能和 Worker 配置。模型是否可用取决于当前 Codex 运行环境；插件不会强制切换正在运行的会话或更改 Root 模型。
 
-The root-level `install.sh` and policy below are retained for compatibility with the earlier Spark/Terra-based setup. They are not the recommended current package; use the plugin above for the maintained Astra/Sol/Luna routing policy.
+## 卸载
 
----
-
-# Earlier portable configuration package
-
-这个旧版安装器会配置一套 Codex 模型路由策略：根代理默认使用 Luna，按任务风险路由到 Spark、Terra、Sol 或 Astra。它不会复制机器或项目相关配置，例如 `projects` 信任记录、本地路径、插件缓存、认证信息、hooks 状态或会话数据。
-
-## 模型与推理强度（旧版）
-
-| 角色 | 模型 | 推理强度 |
-| --- | --- | --- |
-| root | `gpt-5.6-luna` | `low` |
-| spark_worker | `gpt-5.3-codex-spark` | `low` |
-| terra_worker | `gpt-5.6-terra` | `medium` |
-| sol_worker | `gpt-5.6-sol` | `high` |
-| astra_worker | `gpt-6-astra` | `high` |
-
-## 前提条件
-
-- Python 3.11 或更高版本（使用标准库 `tomllib`）。
-- 一个可写的 Codex home；默认是 `~/.codex`。请先停止依赖同一配置文件的外部编辑器。
-
-## 安装与检查
-
-克隆仓库后进入根目录：
+在 `plugin/` 目录运行：
 
 ```bash
-git clone git@github.com:Meepoljd/codex-model-routing.git
-cd codex-model-routing
+bash uninstall.sh
 ```
 
-先查看将发生的改变：
-
-```bash
-./install.sh --codex-home /path/to/.codex --dry-run
-```
-
-确认后安装：
-
-```bash
-./install.sh --codex-home /path/to/.codex
-```
-
-省略 `--codex-home` 时使用 `~/.codex`。安装器会验证已有 `config.toml`，仅合并根级 `model`、`model_reasoning_effort` 和 `[agents].enabled`，保留其余 TOML 内容及注释；然后复制四个受管 worker 文件，并在 `AGENTS.md` 写入或替换 `Model Routing Policy` 章节。重复运行不会叠加策略块。
-
-每次确实修改前，安装器会在目标目录创建唯一的 `codex-model-routing-backup-...` 备份目录，其中包含每个被替换文件的原始版本和 `manifest.json`。清单对新增文件标记为 `null`。若配置语法无效、目标是符号链接、或预期文件路径是目录，安装器会在写入前失败。少见且不能安全保留语义的 TOML 布局也会被拒绝。
-
-## 回滚
-
-关闭 Codex 后，将最近一次备份目录中对应文件复制回 Codex home 的同一路径；例如将备份中的 `config.toml`、`AGENTS.md` 和 `agents/` 内容还原。查看 `manifest.json`：值为 `null` 的路径在安装前不存在，可手动删除对应的新增文件。
-
-配置和文档只能影响之后启动的会话，**不会切换正在运行的 Codex 会话模型**。
-
-路由策略是给 Codex 的提示词和 worker 默认值，并不是一个会在运行时确定性分类任务的程序；明确选择的用户模型仍优先。
-
-## 测试
-
-```bash
-python3 -m unittest discover -s tests -v
-```
+卸载会移除插件与本地插件市场，并根据安装时的备份还原 Worker 配置。备份保存在 `~/.codex/backups/model-routing-plugin-<时间戳>/`。
