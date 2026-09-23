@@ -2,6 +2,14 @@
 
 本仓库提供一套可安装的 Codex 模型路由插件，按任务类型、风险、耦合度和根因不确定性选择合适的模型，并通过 Codex 原生 Agent 委派工作。
 
+## 先计划，再分配
+
+Root 先给出目标、拆分判断、任务依赖、负责边界和完成标准，再选择自己处理、一个 Worker 或多个 Worker。只有依赖已满足且工作互相独立时才并行；高度耦合的实现由一个合适档位的 Worker 负责。
+
+执行中，Worker 回报阶段成果和阻塞，Root 在主会话展示计划、任务状态、证据及最终汇总。支持的客户端可以打开 Worker 线程查看细节；本插件不实现全量工具日志自动转发，也不展示模型的完整私有推理。
+
+详细流程、可见性边界和扩展方式见[中文文档](plugin/README.md) · [English](plugin/README.en.md)。
+
 ## 路由策略
 
 按以下顺序评估；高风险规则优先于低成本规则。
@@ -21,21 +29,20 @@
 
 实现由三部分组成：
 
-1. **路由技能**：`plugin/plugins/model-routing/skills/model-routing/SKILL.md`。它定义各档适用任务、升级条件、委派要求和会话生效范围。安装插件后，Codex 可发现并使用 `$model-routing`。
-2. **Worker 配置**：`plugin/agents/*_worker.toml`。每个文件声明 Agent 名称、模型 ID、推理强度和职责边界。TOML 提供 Worker 的默认值与指令，不会令不可用模型变得可用。
-3. **安装脚本**：`plugin/install.sh` 把 `plugin/` 注册为本地插件市场、安装技能，并将 Worker TOML 复制到 `~/.codex/agents/`。覆盖同名文件前会备份。卸载脚本移除插件并尽可能按该备份还原 Worker 文件。
-
-插件规则是提示词，不是运行时强制策略。明确的用户指令、项目级规则和运行环境能力仍可能影响最终选择。配置变更要在新会话中验证，不会热切换已运行会话。
+1. **路由技能**：`plugin/plugins/model-routing/skills/model-routing/SKILL.md`。它定义计划、任务拆分、各档适用任务、升级条件、委派要求和会话生效范围。安装后可显式使用 `$model-routing`。
+2. **Worker 配置**：`plugin/agents/*_worker.toml`。每个文件声明 Agent 名称、模型 ID、推理强度和职责边界；Worker 会按约定发送阶段更新。TOML 不会令不可用模型变得可用。
+3. **安装脚本**：`plugin/install.sh` 注册本地插件市场、安装技能，并将 Worker TOML 复制到 `~/.codex/agents/`；覆盖同名文件前会备份。卸载脚本移除插件并尽可能按该备份还原 Worker 文件。
 
 ## 如何 Hack / 扩展
 
-建议先在分支中修改，再用临时 `CODEX_HOME` 安装试跑，确认后再合并到自己的主分支。
+建议先在分支中修改，再用临时 `CODEX_HOME` 安装试跑，确认后再合并。
 
-- **调整任务分档或升级门槛**：编辑技能中的 `Tiers` 和 `Delegation rules`，保持 Astra → Sol → Luna 的评估顺序；新增高档条件时写清楚可核验的触发证据，避免只因任务长或文件多就升级。
-- **换模型或推理强度**：编辑对应的 `plugin/agents/<role>.toml` 中的 `model` 和 `model_reasoning_effort`。技能说明、Agent 名称与 TOML 中的 `name` 应保持一致；修改后检查当前 Codex 是否支持该模型 ID 与推理强度。
-- **增加一个 Worker 档位**：新增 TOML 配置，随后同步更新技能的档位表、升级路径、安装脚本中的备份/安装逻辑，以及卸载脚本中的还原逻辑。仅新增一个文件不足以让 Root 知道何时委派它。
-- **改变安装行为**：修改 `plugin/install.sh` 或 `plugin/uninstall.sh`。保持备份与回滚配对；不要把本机的 `config.toml`、认证信息、hooks、项目路径或会话数据打包进插件。
-- **试跑插件**：在新会话中触发 `$model-routing`，用一个轻量任务和一个高风险/架构任务检查路由解释与实际委派是否匹配。检查 Worker 回报是否包含证据、验证结果和未解决问题。不要把仅在技能中描述的委派当成实际执行。
+- **调整任务拆分或升级门槛**：编辑技能中的 `Plan before assigning`、`Tiers` 和 `Handoff and native execution`。为子任务写明依赖、负责人、交付物及验收证据；不要只因任务长或文件多就升级。
+- **换模型或推理强度**：编辑 `plugin/agents/<role>.toml` 中的 `model` 和 `model_reasoning_effort`，并同步技能说明；确认运行环境支持所填值。
+- **增加 Worker**：新增 TOML 后，同步更新技能中的分档、依赖分配和交接规则，以及安装脚本的备份/安装逻辑和卸载脚本的还原逻辑。
+- **改进度展示**：修改 Worker 的阶段回报指令和技能中的 `Visible progress and integration`。增加自动日志转发或独立看板需要额外实现，不能只通过提示词宣称已支持。
+- **改变安装行为**：修改 `plugin/install.sh` 或 `plugin/uninstall.sh`，保持备份和还原逻辑一致。不要打包本机配置、认证信息、hooks、项目路径或会话数据。
+- **验证**：检查文档链接、TOML/JSON 和安装路径。需要做运行验证时，在临时配置和新会话中分别检查轻量任务不滥拆、耦合任务有单一负责人、独立任务按依赖分配，并确认阶段消息确实到达 Root；明确标记未实测的项目。
 
 ## 一键安装
 
