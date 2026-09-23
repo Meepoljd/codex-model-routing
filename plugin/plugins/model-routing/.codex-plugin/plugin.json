@@ -1,0 +1,30 @@
+{
+  "name": "model-routing",
+  "version": "1.0.0",
+  "description": "Route Codex work to the least costly model likely to complete it correctly, with evidence-based escalation and native worker delegation.",
+  "author": {
+    "name": "Local Model Routing"
+  },
+  "license": "MIT",
+  "keywords": [
+    "model-routing",
+    "agents",
+    "delegation",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Model Routing",
+    "shortDescription": "Choose a model by task risk and complexity.",
+    "longDescription": "Provides a portable Codex routing policy, Luna/Sol/Astra worker profiles, and one-command install and uninstall scripts.",
+    "developerName": "Local Model Routing",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Apply the model-routing policy to this task and delegate to the appropriate native worker when required."
+    ]
+  }
+}
