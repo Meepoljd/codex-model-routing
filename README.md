@@ -15,6 +15,28 @@
 
 不要根据提示长度、文件数量或模型新旧决定升级。通用的 GPT-6 请求按任务类型路由至 Sol 或 Luna；只有明确指定 GPT-6 Astra 才直接选择 Astra。安全、架构和并发任务通常由 Sol 处理。
 
+## 实现原理
+
+这个插件是**提示词驱动的协作策略**，不是拦截每条请求、自动分类任务的路由代理，也不会修改当前会话的 Root 模型。Root 根据技能里的规则评估任务，然后在需要时调用 Codex 原生 `spawn_agent`，选择 `luna_worker`、`sol_worker` 或 `astra_worker` 并等待结果。Worker 在独立委派上下文中完成分配的工作；Root 负责整合证据并决定是否升级。
+
+实现由三部分组成：
+
+1. **路由技能**：`plugin/plugins/model-routing/skills/model-routing/SKILL.md`。它定义各档适用任务、升级条件、委派要求和会话生效范围。安装插件后，Codex 可发现并使用 `$model-routing`。
+2. **Worker 配置**：`plugin/agents/*_worker.toml`。每个文件声明 Agent 名称、模型 ID、推理强度和职责边界。TOML 提供 Worker 的默认值与指令，不会令不可用模型变得可用。
+3. **安装脚本**：`plugin/install.sh` 把 `plugin/` 注册为本地插件市场、安装技能，并将 Worker TOML 复制到 `~/.codex/agents/`。覆盖同名文件前会备份。卸载脚本移除插件并尽可能按该备份还原 Worker 文件。
+
+插件规则是提示词，不是运行时强制策略。明确的用户指令、项目级规则和运行环境能力仍可能影响最终选择。配置变更要在新会话中验证，不会热切换已运行会话。
+
+## 如何 Hack / 扩展
+
+建议先在分支中修改，再用临时 `CODEX_HOME` 安装试跑，确认后再合并到自己的主分支。
+
+- **调整任务分档或升级门槛**：编辑技能中的 `Tiers` 和 `Delegation rules`，保持 Astra → Sol → Luna 的评估顺序；新增高档条件时写清楚可核验的触发证据，避免只因任务长或文件多就升级。
+- **换模型或推理强度**：编辑对应的 `plugin/agents/<role>.toml` 中的 `model` 和 `model_reasoning_effort`。技能说明、Agent 名称与 TOML 中的 `name` 应保持一致；修改后检查当前 Codex 是否支持该模型 ID 与推理强度。
+- **增加一个 Worker 档位**：新增 TOML 配置，随后同步更新技能的档位表、升级路径、安装脚本中的备份/安装逻辑，以及卸载脚本中的还原逻辑。仅新增一个文件不足以让 Root 知道何时委派它。
+- **改变安装行为**：修改 `plugin/install.sh` 或 `plugin/uninstall.sh`。保持备份与回滚配对；不要把本机的 `config.toml`、认证信息、hooks、项目路径或会话数据打包进插件。
+- **试跑插件**：在新会话中触发 `$model-routing`，用一个轻量任务和一个高风险/架构任务检查路由解释与实际委派是否匹配。检查 Worker 回报是否包含证据、验证结果和未解决问题。不要把仅在技能中描述的委派当成实际执行。
+
 ## 一键安装
 
 ```bash
