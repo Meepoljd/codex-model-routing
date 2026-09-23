@@ -1,0 +1,21 @@
+{
+  "name": "model-routing",
+  "interface": {
+    "displayName": "Model Routing",
+    "description": "Task-aware model selection and native worker delegation for Codex."
+  },
+  "plugins": [
+    {
+      "name": "model-routing",
+      "source": {
+        "source": "local",
+        "path": "./plugins/model-routing"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "NOT_REQUIRED"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
