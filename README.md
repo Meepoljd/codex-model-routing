@@ -1,8 +1,28 @@
-# Codex 模型路由（可移植安装包）
+# Codex Model Routing
 
-这个仓库只安装一套可复用的 Codex 模型路由策略：根代理默认使用 Luna，按任务风险路由到 Spark、Terra、Sol 或 Astra。它不会复制机器或项目相关配置，例如 `projects` 信任记录、本地路径、插件缓存、认证信息、hooks 状态或会话数据。
+## Recommended: install the Codex plugin
 
-## 模型与推理强度
+The current portable package is in [`plugin/`](plugin/). It implements the current Astra → Sol → Luna routing policy and native worker profiles.
+
+```bash
+git clone git@github.com:Meepoljd/codex-model-routing.git
+cd codex-model-routing/plugin
+bash install.sh
+```
+
+The installer registers this directory as a local plugin marketplace, installs the `model-routing` skill, and backs up/replaces the three worker profiles in `~/.codex/agents/`. It leaves `~/.codex/AGENTS.md` and unrelated Codex configuration untouched. Start a new Codex task after installation. See [`plugin/README.md`](plugin/README.md) for manual setup and uninstall steps.
+
+## Legacy standalone configuration installer
+
+The root-level `install.sh` and policy below are retained for compatibility with the earlier Spark/Terra-based setup. They are not the recommended current package; use the plugin above for the maintained Astra/Sol/Luna routing policy.
+
+---
+
+# Earlier portable configuration package
+
+这个旧版安装器会配置一套 Codex 模型路由策略：根代理默认使用 Luna，按任务风险路由到 Spark、Terra、Sol 或 Astra。它不会复制机器或项目相关配置，例如 `projects` 信任记录、本地路径、插件缓存、认证信息、hooks 状态或会话数据。
+
+## 模型与推理强度（旧版）
 
 | 角色 | 模型 | 推理强度 |
 | --- | --- | --- |
@@ -19,7 +39,7 @@
 
 ## 安装与检查
 
-克隆仓库后进入目录：
+克隆仓库后进入根目录：
 
 ```bash
 git clone git@github.com:Meepoljd/codex-model-routing.git
