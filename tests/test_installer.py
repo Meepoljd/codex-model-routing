@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
+
+import installer
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -182,6 +186,82 @@ enabled = false
             second = run(home, "--uninstall")
             self.assertEqual(second.returncode, 0, second.stderr)
             self.assertIn("no changes", second.stdout)
+
+    def test_temp_uninstall_does_not_disable_timer_owned_by_another_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            owner = root / "owner-home"
+            temporary = root / "temporary-home"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            log = root / "systemctl.jsonl"
+            systemctl = fake_bin / "systemctl"
+            systemctl.write_text(
+                '''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_SYSTEMD_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(args) + "\\n")
+if len(args) >= 3 and args[0:2] == ["--user", "show"]:
+    unit = args[2]
+    print(os.path.join(os.environ["FAKE_SYSTEMD_HOME"], "model-routing", "systemd", unit))
+''',
+                encoding="utf-8",
+            )
+            systemctl.chmod(0o755)
+            environment = {
+                "HOME": str(root),
+                "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+                "FAKE_SYSTEMD_LOG": str(log),
+                "FAKE_SYSTEMD_HOME": str(owner),
+            }
+            with mock.patch.dict(os.environ, environment):
+                installer.install(
+                    temporary,
+                    dry_run=False,
+                    no_refresh=True,
+                    schedule="auto",
+                )
+                installer.uninstall(temporary, dry_run=False)
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertTrue(any(call[0:2] == ["--user", "show"] for call in calls))
+            self.assertFalse(any("disable" in call for call in calls), calls)
+
+    def test_schedule_disable_stops_timer_owned_by_same_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "owned-home"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            log = root / "systemctl.jsonl"
+            systemctl = fake_bin / "systemctl"
+            systemctl.write_text(
+                '''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_SYSTEMD_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(args) + "\\n")
+if len(args) >= 3 and args[0:2] == ["--user", "show"]:
+    print(os.path.join(os.environ["FAKE_SYSTEMD_HOME"], "model-routing", "systemd", args[2]))
+''',
+                encoding="utf-8",
+            )
+            systemctl.chmod(0o755)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(root),
+                    "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+                    "FAKE_SYSTEMD_LOG": str(log),
+                    "FAKE_SYSTEMD_HOME": str(home),
+                },
+            ):
+                installer.install(home, dry_run=False, no_refresh=True, schedule="disable")
+            calls = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertTrue(
+                any(call[0:3] == ["--user", "disable", "--now"] for call in calls),
+                calls,
+            )
 
 
 if __name__ == "__main__":

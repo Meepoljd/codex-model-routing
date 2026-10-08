@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,11 @@ import subprocess
 import sys
 import tomllib
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - systemd user services are Linux-only.
+    fcntl = None
 
 from model_router import (
     MANAGED_ROOT_MARKER,
@@ -323,6 +329,56 @@ def _systemd_available() -> bool:
     return sys.platform.startswith("linux") and shutil.which("systemctl") is not None
 
 
+@contextmanager
+def _systemd_timer_lock():
+    """Serialize mutations of the user-global model-routing unit names."""
+    path = Path.home() / ".codex-model-routing-systemd.lock"
+    handle = path.open("a+")
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _unit_fragment_path(unit: str) -> Path | None:
+    result = subprocess.run(
+        ["systemctl", "--user", "show", unit, "--property=FragmentPath", "--value"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value:
+        return None
+    return Path(value).expanduser().absolute()
+
+
+def timer_owned_by(home: Path) -> bool:
+    """Return true only when both global unit names belong to this Codex home."""
+    if not _systemd_available():
+        return False
+    unit_dir = home.expanduser().absolute() / "model-routing" / "systemd"
+    expected = {
+        "codex-model-routing.timer": unit_dir / "codex-model-routing.timer",
+        "codex-model-routing.service": unit_dir / "codex-model-routing.service",
+    }
+    for unit, expected_path in expected.items():
+        actual = _unit_fragment_path(unit)
+        if actual is None:
+            return False
+        try:
+            if actual.resolve(strict=False) != expected_path.resolve(strict=False):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def enable_timer(home: Path, *, required: bool) -> str | None:
     if not _systemd_available():
         if required:
@@ -342,8 +398,15 @@ def enable_timer(home: Path, *, required: bool) -> str | None:
         ["systemctl", "--user", "enable", "--now", "codex-model-routing.timer"],
     )
     try:
-        for command in commands:
-            subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with _systemd_timer_lock():
+            for command in commands:
+                subprocess.run(
+                    command,
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
     except subprocess.CalledProcessError as exc:
         if required:
             raise InstallError(f"could not enable systemd timer: {exc.stderr.strip()}") from exc
@@ -351,22 +414,32 @@ def enable_timer(home: Path, *, required: bool) -> str | None:
     return None
 
 
-def disable_timer() -> None:
-    if not _systemd_available():
-        return
-    subprocess.run(
-        ["systemctl", "--user", "disable", "--now", "codex-model-routing.timer"],
-        check=False,
-        text=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["systemctl", "--user", "daemon-reload"],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+def disable_timer(home: Path) -> bool:
+    """Disable the shared unit names only when this home owns both fragments."""
+    with _systemd_timer_lock():
+        if not timer_owned_by(home):
+            return False
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", "codex-model-routing.timer"],
+            check=False,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "disable", "codex-model-routing.service"],
+            check=False,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    return True
 
 
 def _install_files(
@@ -505,10 +578,15 @@ def install(
             )
     expected_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().absolute()
     should_enable = schedule == "enable" or (schedule == "auto" and home == expected_home)
-    if should_enable:
-        warning = enable_timer(home, required=schedule == "enable")
-        if warning:
-            warnings.append(warning)
+    if should_enable or schedule == "disable":
+        with routing_lock(home):
+            runtime_exists = (home / "model-routing" / "state.json").is_file()
+            if should_enable and runtime_exists:
+                warning = enable_timer(home, required=schedule == "enable")
+                if warning:
+                    warnings.append(warning)
+            elif schedule == "disable":
+                disable_timer(home)
     return changes, backup, warnings
 
 
@@ -586,8 +664,8 @@ def uninstall(home: Path, *, dry_run: bool) -> tuple[list[Path], Path | None]:
     home = home.expanduser().absolute()
     if dry_run:
         return _uninstall_files(home, dry_run=True)
-    disable_timer()
     with routing_lock(home):
+        disable_timer(home)
         return _uninstall_files(home, dry_run=False)
 
 

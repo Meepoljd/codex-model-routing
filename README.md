@@ -43,6 +43,7 @@ journalctl --user -u codex-model-routing.service --since today
 ```
 
 timer 使用安装时找到的 `codex` 所在目录构造 PATH，并运行 `~/.codex` 内的独立脚本与模板，不依赖仓库 checkout 或插件 cache。
+如需关闭自动刷新，可在仓库根目录运行 `python3 installer.py --codex-home ~/.codex --no-refresh --schedule disable`；它只会停用 unit 路径确实属于该 Codex home 的 timer，不会影响其它 home。
 
 ## 卸载与开发验证
 

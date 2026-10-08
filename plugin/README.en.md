@@ -56,6 +56,8 @@ journalctl --user -u codex-model-routing.service --since today
 
 If a marketplace with the same name points elsewhere, installation stops with inspection and repair commands instead of removing or silently replacing it. After changing plugin contents, use the official cachebuster update flow, reinstall, and validate in a new task.
 
+To turn off periodic refresh, run `python3 installer.py --codex-home ~/.codex --no-refresh --schedule disable` from the repository root. The installer first verifies that both the timer and service `FragmentPath` values belong to that Codex home, so a temporary or parallel installation cannot disable another home's units.
+
 ## Uninstall and development
 
 ```bash

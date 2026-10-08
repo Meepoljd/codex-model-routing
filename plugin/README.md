@@ -56,6 +56,8 @@ journalctl --user -u codex-model-routing.service --since today
 
 如果同名 marketplace 已指向其它路径，安装器会停止并显示检查/修复命令，不会删除或悄悄替换它。插件内容更新后需要使用官方 cachebuster 更新流程重新安装，并在新任务中验证。
 
+需要关闭周期刷新时，在仓库根目录执行 `python3 installer.py --codex-home ~/.codex --no-refresh --schedule disable`。安装器会先核对 timer 和 service 的 `FragmentPath` 都属于这个 Codex home，避免停用其它临时或并行安装的 unit。
+
 ## 卸载
 
 ```bash
