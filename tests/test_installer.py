@@ -46,7 +46,8 @@ class InstallerIntegrationTest(unittest.TestCase):
             self.assertEqual(config["model_reasoning_effort"], "low")
             self.assertTrue(config["agents"]["enabled"])
             self.assertTrue((home / "model-routing" / "model_router.py").is_file())
-            self.assertTrue((home / "model-routing" / "templates" / "sol_worker.toml").is_file())
+            self.assertTrue((home / "model-routing" / "radar_source.py").is_file())
+            self.assertTrue((home / "model-routing" / "templates" / "complex_worker.toml").is_file())
             service = (home / "model-routing/systemd/codex-model-routing.service").read_text()
             self.assertIn(str(home / "model-routing/model_router.py"), service)
             self.assertNotIn(str(ROOT), service)
@@ -59,9 +60,9 @@ class InstallerIntegrationTest(unittest.TestCase):
 
     def test_packaged_workers_are_three_dynamic_roles_and_plugin_copy_matches(self):
         expected = {
-            "luna_worker.toml": ("gpt-6-luna", "medium"),
-            "sol_worker.toml": ("gpt-6.1-sol", "high"),
-            "astra_worker.toml": ("gpt-6-astra", "high"),
+            "routine_worker.toml": ("gpt-6-luna", "medium"),
+            "complex_worker.toml": ("gpt-6.1-sol", "high"),
+            "frontier_worker.toml": ("gpt-6-astra", "high"),
         }
         self.assertEqual({path.name for path in (ROOT / "agents").glob("*.toml")}, set(expected))
         for filename, values in expected.items():
@@ -97,15 +98,15 @@ enabled = false
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
             (home / "agents").mkdir(parents=True)
-            custom = 'name = "luna_worker"\nmodel = "my-model"\nmodel_reasoning_effort = "high"\n'
-            (home / "agents/luna_worker.toml").write_text(custom, encoding="utf-8")
+            custom = 'name = "routine_worker"\nmodel = "my-model"\nmodel_reasoning_effort = "high"\n'
+            (home / "agents/routine_worker.toml").write_text(custom, encoding="utf-8")
             (home / "AGENTS.md").write_text(
                 "# Mine\n\nkeep before\n\n## Model Routing Policy\nold\n\n## Other\nkeep after\n",
                 encoding="utf-8",
             )
             installed = run(home)
             self.assertEqual(installed.returncode, 0, installed.stderr)
-            self.assertEqual((home / "agents/luna_worker.toml").read_text(), custom)
+            self.assertEqual((home / "agents/routine_worker.toml").read_text(), custom)
             document = (home / "AGENTS.md").read_text()
             self.assertIn("keep before", document)
             self.assertIn("## Other\nkeep after", document)
@@ -113,7 +114,7 @@ enabled = false
 
             removed = run(home, "--uninstall")
             self.assertEqual(removed.returncode, 0, removed.stderr)
-            self.assertEqual((home / "agents/luna_worker.toml").read_text(), custom)
+            self.assertEqual((home / "agents/routine_worker.toml").read_text(), custom)
             self.assertNotIn("codex-model-routing:begin", (home / "AGENTS.md").read_text())
 
     def test_malformed_config_is_non_destructive(self):
@@ -173,6 +174,33 @@ enabled = false
             backups = list((home / "backups").glob("model-routing-refresh-*"))
             self.assertTrue(backups)
             self.assertTrue(any((backup / "agents/spark_worker.toml").is_file() for backup in backups))
+
+    def test_v1_state_migrates_only_proven_managed_legacy_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / ".codex"
+            agents = home / "agents"
+            runtime = home / "model-routing"
+            agents.mkdir(parents=True)
+            runtime.mkdir()
+            legacy = 'name = "luna_worker"\nmodel = "old"\nmodel_reasoning_effort = "low"\n'
+            custom = 'name = "sol_worker"\nmodel = "mine"\nmodel_reasoning_effort = "high"\n'
+            (agents / "luna_worker.toml").write_text(legacy)
+            (agents / "sol_worker.toml").write_text(custom)
+            state = {
+                "version": 1,
+                "catalogSelection": {"luna_worker": {"model": "old", "effort": "low"}},
+                "managedProfiles": {
+                    "luna_worker": {"managed": True, "sha256": installer.sha256_text(legacy)}
+                },
+            }
+            (runtime / "state.json").write_text(json.dumps(state))
+            result = run(home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((agents / "luna_worker.toml").exists())
+            self.assertEqual((agents / "sol_worker.toml").read_text(), custom)
+            migrated = json.loads((runtime / "state.json").read_text())
+            self.assertIn("routine_worker", migrated["catalogSelection"])
+            self.assertNotIn("luna_worker", migrated["managedProfiles"])
 
     def test_uninstall_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,0 +1,5 @@
+name = "frontier_worker"
+description = "Exceptional end-to-end work selected dynamically from the current native catalog using Codex Radar evidence; explicit GPT-6 Astra remains a direct model request."
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
+developer_instructions = "Take only exceptional end-to-end work: explicit user-selected GPT-6 Astra, repeated evidence-backed complex_worker failures, or interacting architectural uncertainties and failure cost that make the complex tier inadequate. GPT-6 aliases mean GPT-6 Astra specifically and never mean this dynamically selected role. Stay within assigned paths, preserve other edits, honor analysis-only requests, report evidence and verification, and do not independently delegate or expand scope."

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import time
@@ -13,24 +12,21 @@ import unittest
 
 import model_router
 from model_router import (
+    DEFAULT_ALLOWED_EFFORTS,
+    ROLES,
     RoutingError,
     discover_catalog,
+    normalize_catalog,
+    read_state,
     refresh,
     routing_lock,
     select_models,
     transactional_write,
 )
+from radar_source import RadarSourceError
 
 
-ROOT = Path(__file__).resolve().parents[1]
-INSTALLER = ROOT / "installer.py"
-
-
-def item(
-    model: str,
-    efforts: tuple[str, ...] = ("low", "medium", "high"),
-    **extra: object,
-) -> dict[str, object]:
+def item(model: str, efforts: tuple[str, ...] = ("low", "medium", "high"), **extra: object) -> dict[str, object]:
     result: dict[str, object] = {
         "id": model,
         "model": model,
@@ -44,172 +40,210 @@ def item(
     return result
 
 
-def catalog(*models: dict[str, object]) -> list[object]:
-    return list(models) or [
-        item("gpt-6-luna"),
-        item("gpt-6.1-sol"),
-        item("gpt-6-astra"),
-    ]
+def evidence(*points: tuple[str, str, float], costs: dict[tuple[str, str], tuple[float, int]] | None = None):
+    result = []
+    for model, effort, quality in points:
+        cost, samples = (costs or {}).get((model, effort), (None, 0))
+        result.append(
+            {
+                "model": model,
+                "effort": effort,
+                "quality": quality,
+                "sampleCount": 100,
+                "costUsd": cost,
+                "costSamples": samples,
+            }
+        )
+    return {
+        "sourceKind": "injected-test",
+        "sourceUrl": "injected://fixture",
+        "sourceUpdatedAt": "2026-10-08T00:00:00+00:00",
+        "fetchedAt": "2026-10-08T00:00:00+00:00",
+        "fingerprint": "fixture",
+        "qualityScale": 100,
+        "points": result,
+    }
 
 
-def install_temp(home: Path) -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(INSTALLER),
-            "--codex-home",
-            str(home),
-            "--no-refresh",
-            "--schedule",
-            "disable",
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode:
-        raise AssertionError(result.stderr)
+def make_install(home: Path, *, version: int = 1) -> Path:
+    (home / "model-routing").mkdir(parents=True)
+    (home / "agents").mkdir()
+    state = {
+        "version": version,
+        "managedProfiles": {role: {"managed": True} for role in ROLES},
+        "managedRoot": {"managed": False},
+    }
+    (home / "model-routing/state.json").write_text(json.dumps(state), encoding="utf-8")
+    templates = home / "templates"
+    templates.mkdir()
+    for role in ROLES:
+        (templates / f"{role}.toml").write_text(
+            f'name = "{role}"\nmodel = "placeholder"\nmodel_reasoning_effort = "low"\n',
+            encoding="utf-8",
+        )
+    return templates
 
 
 class SelectionTest(unittest.TestCase):
-    def test_semantic_numeric_versions_are_selected(self):
+    def test_unknown_model_names_are_ranked_without_family_or_version_rules(self):
         selected = select_models(
-            catalog(
-                item("gpt-6.9-luna"),
-                item("gpt-6.10-luna"),
-                item("gpt-6.9-sol"),
-                item("gpt-6.10-sol"),
-                item("gpt-6.9-astra"),
-                item("gpt-6.10-astra"),
-            )
+            [
+                item("acme-nebula", ("high",)),
+                item("model_2027/orbit", ("medium",)),
+                item("future:quark", ("low",)),
+            ],
+            evidence=evidence(
+                ("acme-nebula", "high", 100),
+                ("model_2027/orbit", "medium", 91),
+                ("future:quark", "low", 70),
+            ),
         )
-        self.assertEqual(selected["luna_worker"]["model"], "gpt-6.10-luna")
-        self.assertEqual(selected["sol_worker"]["model"], "gpt-6.10-sol")
-        self.assertEqual(selected["astra_worker"]["model"], "gpt-6.10-astra")
+        self.assertEqual(selected["routine_worker"], {"model": "future:quark", "effort": "low"})
+        self.assertEqual(selected["complex_worker"], {"model": "model_2027/orbit", "effort": "medium"})
+        self.assertEqual(selected["frontier_worker"], {"model": "acme-nebula", "effort": "high"})
+        self.assertEqual(selected["root"], selected["routine_worker"])
 
-    def test_hidden_special_unknown_and_explicitly_tool_disabled_are_rejected(self):
+    def test_roles_can_share_one_model_at_different_efforts(self):
         selected = select_models(
-            catalog(
-                item("gpt-9-luna", hidden=True),
-                item("gpt-8-luna", modelSpecialty="auto-review"),
-                item("gpt-7-luna", supportsTools=False),
-                item("gpt-99-orbit"),
-                item("gpt-6-luna"),
-                item("gpt-6-sol"),
-                item("gpt-6-astra"),
-            )
+            [item("brand-new-model")],
+            evidence=evidence(
+                ("brand-new-model", "low", 70),
+                ("brand-new-model", "medium", 92),
+                ("brand-new-model", "high", 100),
+            ),
         )
-        self.assertEqual(selected["luna_worker"]["model"], "gpt-6-luna")
+        self.assertEqual([selected[role]["model"] for role in ROLES], ["brand-new-model"] * 3)
+        self.assertEqual([selected[role]["effort"] for role in ROLES], ["low", "medium", "high"])
 
-    def test_required_effort_is_enforced(self):
-        with self.assertRaisesRegex(RoutingError, "sol model supporting high"):
-            select_models(
-                catalog(
-                    item("gpt-6-luna"),
-                    item("gpt-6-sol", ("low", "medium")),
-                    item("gpt-6-astra"),
-                )
-            )
+    def test_default_policy_never_automatically_selects_xhigh_max_or_ultra(self):
+        selected = select_models(
+            [item("future-one", ("low", "high", "xhigh", "max", "ultra"))],
+            evidence=evidence(
+                ("future-one", "low", 70),
+                ("future-one", "high", 90),
+                ("future-one", "ultra", 150),
+            ),
+        )
+        self.assertNotIn("ultra", {choice["effort"] for choice in selected.values()})
+        self.assertEqual(DEFAULT_ALLOWED_EFFORTS, {"low", "medium", "high"})
 
-    def test_empty_and_malformed_catalogs_fail_closed(self):
-        with self.assertRaises(RoutingError):
-            select_models([])
-        malformed = item("gpt-6-luna")
+    def test_hidden_special_and_explicitly_tool_disabled_models_are_rejected(self):
+        candidates = normalize_catalog(
+            [
+                item("hidden-model", hidden=True),
+                item("special-model", modelSpecialty="auto-review"),
+                item("flagged-special", special=True),
+                item("no-tools", supportsTools=False),
+                item("capability-no-tools", capabilities={"tools": False}),
+                item("eligible-model"),
+            ]
+        )
+        self.assertEqual([candidate.model for candidate in candidates], ["eligible-model"])
+
+    def test_missing_tool_capability_field_is_not_treated_as_false(self):
+        self.assertEqual(normalize_catalog([item("model-with-unspecified-tools")])[0].model, "model-with-unspecified-tools")
+
+    def test_unsafe_tokens_and_malformed_catalogs_fail_closed(self):
+        with self.assertRaisesRegex(RoutingError, "invalid model token"):
+            normalize_catalog([item('bad"\nmodel')])
+        malformed = item("valid-model")
         malformed.pop("hidden")
         with self.assertRaisesRegex(RoutingError, "missing required fields"):
-            select_models([malformed])
+            normalize_catalog([malformed])
+
+    def test_removed_model_and_unsupported_effort_cannot_be_selected(self):
+        selected = select_models(
+            [item("remaining")],
+            evidence=evidence(
+                ("removed", "high", 100),
+                ("remaining", "ultra", 120),
+                ("remaining", "low", 80),
+            ),
+        )
+        self.assertTrue(all(choice == {"model": "remaining", "effort": "low"} for choice in selected.values()))
+
+    def test_verified_cost_can_choose_within_quality_floor(self):
+        selected = select_models(
+            [item("quality-leader", ("high",)), item("cheap-qualified", ("medium",))],
+            evidence=evidence(
+                ("quality-leader", "high", 100),
+                ("cheap-qualified", "medium", 92),
+                costs={("quality-leader", "high"): (8.0, 100), ("cheap-qualified", "medium"): (1.0, 100)},
+            ),
+        )
+        self.assertEqual(selected["complex_worker"]["model"], "cheap-qualified")
+        self.assertEqual(selected["frontier_worker"]["model"], "quality-leader")
 
 
 class RefreshTest(unittest.TestCase):
-    def test_catalog_failure_preserves_last_good_files_and_state(self):
+    def test_v1_state_refreshes_to_v2_with_evidence_and_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
-            install_temp(home)
-            refresh(home, ROOT / "agents", catalog=catalog())
-            before_state = (home / "model-routing/state.json").read_text()
-            before_profiles = {
-                path.name: path.read_text() for path in (home / "agents").glob("*.toml")
-            }
-            with self.assertRaises(RoutingError):
-                refresh(home, ROOT / "agents", catalog=[])
-            self.assertEqual((home / "model-routing/state.json").read_text(), before_state)
-            self.assertEqual(
-                {path.name: path.read_text() for path in (home / "agents").glob("*.toml")},
-                before_profiles,
+            templates = make_install(home, version=1)
+            result = refresh(
+                home,
+                templates,
+                catalog=[item("one", ("low",)), item("two", ("medium",)), item("three", ("high",))],
+                evidence=evidence(("one", "low", 70), ("two", "medium", 91), ("three", "high", 100)),
             )
+            self.assertEqual(result["version"], 2)
+            self.assertEqual(result["refreshStatus"]["status"], "current")
+            self.assertEqual(result["evidence"]["thresholds"]["allowedEfforts"], ["low", "medium", "high"])
+            self.assertEqual(tomllib.loads((home / "agents/routine_worker.toml").read_text())["model"], "one")
+            self.assertEqual(read_state(home)["catalogSelection"]["frontier_worker"]["model"], "three")
 
-    def test_rpc_failure_preserves_last_good_state(self):
+    def test_source_outage_records_degraded_and_preserves_last_good_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
-            install_temp(home)
-            before = (home / "model-routing/state.json").read_text()
-            with mock.patch(
-                "model_router.discover_catalog", side_effect=RoutingError("offline")
-            ):
-                with self.assertRaisesRegex(RoutingError, "offline"):
-                    refresh(home, ROOT / "agents")
-            self.assertEqual((home / "model-routing/state.json").read_text(), before)
+            templates = make_install(home)
+            catalog = [item("one", ("low",)), item("two", ("high",))]
+            first = refresh(home, templates, catalog=catalog, evidence=evidence(("one", "low", 70), ("two", "high", 100)))
+            profiles_before = {path.name: path.read_text() for path in (home / "agents").glob("*.toml")}
 
-    def test_fresh_last_good_state_honors_ttl_without_catalog_call(self):
+            class Offline:
+                def load(self, candidates):
+                    raise RadarSourceError("offline")
+
+            with self.assertRaisesRegex(RoutingError, "offline"):
+                refresh(home, templates, catalog=catalog, radar=Offline())
+            after = read_state(home)
+            self.assertEqual(after["catalogSelection"], first["catalogSelection"])
+            self.assertEqual(after["evidence"], first["evidence"])
+            self.assertEqual(after["lastSuccessAt"], first["lastSuccessAt"])
+            self.assertEqual(after["refreshStatus"]["status"], "degraded")
+            self.assertEqual({path.name: path.read_text() for path in (home / "agents").glob("*.toml")}, profiles_before)
+
+    def test_fresh_state_honors_ttl_without_catalog_call(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
-            install_temp(home)
-            expected = refresh(home, ROOT / "agents", catalog=catalog())
+            templates = make_install(home)
+            expected = refresh(home, templates, catalog=[item("one", ("low",))], evidence=evidence(("one", "low", 100)))
             with mock.patch("model_router.discover_catalog") as discover:
-                actual = refresh(home, ROOT / "agents", if_stale=True)
+                actual = refresh(home, templates, if_stale=True)
             discover.assert_not_called()
             self.assertEqual(actual["lastSuccessAt"], expected["lastSuccessAt"])
 
     def test_user_modified_profile_stays_unmanaged_across_refreshes(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
-            install_temp(home)
-            luna = home / "agents/luna_worker.toml"
-            custom = luna.read_text().replace('model = "gpt-6-luna"', 'model = "custom-luna"')
-            luna.write_text(custom)
-            first = refresh(home, ROOT / "agents", catalog=catalog())
-            self.assertFalse(first["managedProfiles"]["luna_worker"]["managed"])
-            self.assertEqual(first["activeProfiles"]["luna_worker"]["model"], "custom-luna")
-            refresh(
-                home,
-                ROOT / "agents",
-                catalog=catalog(
-                    item("gpt-7-luna"), item("gpt-7-sol"), item("gpt-7-astra")
-                ),
-            )
-            self.assertEqual(luna.read_text(), custom)
+            templates = make_install(home)
+            refresh(home, templates, catalog=[item("one", ("low",))], evidence=evidence(("one", "low", 100)))
+            target = home / "agents/routine_worker.toml"
+            custom = target.read_text().replace('model = "one"', 'model = "my-custom-model"')
+            target.write_text(custom)
+            first = refresh(home, templates, catalog=[item("two", ("low",))], evidence=evidence(("two", "low", 100)))
+            self.assertFalse(first["managedProfiles"]["routine_worker"]["managed"])
+            refresh(home, templates, catalog=[item("three", ("low",))], evidence=evidence(("three", "low", 100)))
+            self.assertEqual(target.read_text(), custom)
 
-    def test_preexisting_custom_profile_is_never_adopted(self):
+    def test_explicit_root_pin_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
-            (home / "agents").mkdir(parents=True)
-            custom = 'name = "sol_worker"\nmodel = "custom-sol"\nmodel_reasoning_effort = "high"\n'
-            (home / "agents/sol_worker.toml").write_text(custom)
-            install_temp(home)
-            refresh(home, ROOT / "agents", catalog=catalog())
-            refresh(
-                home,
-                ROOT / "agents",
-                catalog=catalog(item("gpt-7-luna"), item("gpt-7-sol"), item("gpt-7-astra")),
-            )
-            self.assertEqual((home / "agents/sol_worker.toml").read_text(), custom)
-
-    def test_user_root_change_ends_management_permanently(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory) / ".codex"
-            install_temp(home)
+            templates = make_install(home)
             config = home / "config.toml"
-            edited = config.read_text().replace('model = "gpt-6-luna"', 'model = "gpt-6-astra"')
-            config.write_text(edited)
-            first = refresh(home, ROOT / "agents", catalog=catalog())
-            self.assertFalse(first["managedRoot"]["managed"])
-            self.assertNotIn("managed-root", config.read_text())
-            refresh(
-                home,
-                ROOT / "agents",
-                catalog=catalog(item("gpt-7-luna"), item("gpt-7-sol"), item("gpt-7-astra")),
-            )
-            self.assertEqual(tomllib.loads(config.read_text())["model"], "gpt-6-astra")
+            config.write_text('model = "explicit-user-model"\nmodel_reasoning_effort = "low"\n')
+            refresh(home, templates, catalog=[item("dynamic", ("low",))], evidence=evidence(("dynamic", "low", 100)))
+            self.assertEqual(tomllib.loads(config.read_text())["model"], "explicit-user-model")
 
     def test_transaction_rolls_back_partial_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -259,15 +293,15 @@ for line in sys.stdin:
     else:
         cursor = request["params"].get("cursor")
         if cursor is None:
-            result = {"data": [{"model":"gpt-6-luna","hidden":False,"modelSpecialty":None,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":""},{"reasoningEffort":"medium","description":""}]}], "nextCursor":"page-2"}
+            result = {"data": [{"model":"unknown-alpha","hidden":False,"modelSpecialty":None,"supportedReasoningEfforts":[{"reasoningEffort":"low","description":""}]}], "nextCursor":"page-2"}
         else:
-            result = {"data": [{"model":"gpt-6-sol","hidden":False,"modelSpecialty":None,"supportedReasoningEfforts":[{"reasoningEffort":"high","description":""}]},{"model":"gpt-6-astra","hidden":False,"modelSpecialty":None,"supportedReasoningEfforts":[{"reasoningEffort":"high","description":""}]}], "nextCursor":None}
+            result = {"data": [{"model":"unknown-beta","hidden":False,"modelSpecialty":None,"supportedReasoningEfforts":[{"reasoningEffort":"high","description":""}]}], "nextCursor":None}
     print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
 ''',
                 encoding="utf-8",
             )
             result = discover_catalog([sys.executable, str(script), str(log)], timeout=2)
-            self.assertEqual(len(result), 3)
+            self.assertEqual(len(result), 2)
             requests = [json.loads(line) for line in log.read_text().splitlines()]
             pages = [request for request in requests if request.get("method") == "model/list"]
             self.assertTrue(pages[0]["params"]["includeHidden"])

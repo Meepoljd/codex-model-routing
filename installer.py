@@ -39,13 +39,14 @@ from model_router import (
 ROOT = Path(__file__).resolve().parent
 POLICY_FILE = ROOT / "policy" / "model-routing-policy.md"
 ENGINE_FILE = ROOT / "model_router.py"
+RADAR_SOURCE_FILE = ROOT / "radar_source.py"
 WORKERS = tuple(f"{role}.toml" for role in ROLES)
 START = "<!-- codex-model-routing:begin -->"
 END = "<!-- codex-model-routing:end -->"
 DEFAULT_SELECTIONS = {
-    "luna_worker": {"model": "gpt-6-luna", "effort": "medium"},
-    "sol_worker": {"model": "gpt-6.1-sol", "effort": "high"},
-    "astra_worker": {"model": "gpt-6-astra", "effort": "high"},
+    "routine_worker": {"model": "gpt-6-luna", "effort": "medium"},
+    "complex_worker": {"model": "gpt-6.1-sol", "effort": "high"},
+    "frontier_worker": {"model": "gpt-6-astra", "effort": "high"},
     "root": {"model": "gpt-6-luna", "effort": "low"},
 }
 DEFAULT_CONFIG = (
@@ -70,6 +71,9 @@ KNOWN_MANAGED_PROFILE_HASHES = {
     },
 }
 LEGACY_REMOVALS = {
+    "luna_worker.toml": None,
+    "sol_worker.toml": None,
+    "astra_worker.toml": None,
     "spark_worker.toml": "7df5f18540776579ec50e5e251ed1d7883c7ab7f22b95416d27c3e2628446e8d",
     "terra_worker.toml": "cdf695ff6dd349ebe198e036678115562c42224e15720eb2b6b4ed9ed011ce11",
 }
@@ -98,7 +102,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_package() -> None:
-    for path in (POLICY_FILE, ENGINE_FILE):
+    for path in (POLICY_FILE, ENGINE_FILE, RADAR_SOURCE_FILE):
         if not path.is_file():
             raise InstallError(f"Missing packaged file: {path}")
     for worker in WORKERS:
@@ -264,6 +268,22 @@ def _initial_state(
 ) -> dict[str, Any]:
     existing = read_state(home)
     if existing is not None:
+        # State v1 named fixed model families.  Preserve its last-good choices
+        # while translating them to the generic role contract used by v2.
+        selection = existing.get("catalogSelection")
+        if isinstance(selection, dict):
+            aliases = {
+                "luna_worker": "routine_worker",
+                "sol_worker": "complex_worker",
+                "astra_worker": "frontier_worker",
+            }
+            migrated = {
+                aliases.get(role, role): value for role, value in selection.items()
+            }
+            for role, default in DEFAULT_SELECTIONS.items():
+                migrated.setdefault(role, default)
+            existing["catalogSelection"] = migrated
+        existing["version"] = STATE_VERSION
         return existing
     return {
         "version": STATE_VERSION,
@@ -290,6 +310,15 @@ def _profile_is_managed(path: Path, role: str, state: dict[str, Any]) -> bool:
     if isinstance(record, dict) and record.get("managed") is True and record.get("sha256") == digest:
         return True
     return digest in KNOWN_MANAGED_PROFILE_HASHES.get(role, set())
+
+
+def _legacy_profile_is_managed(path: Path, role: str, state: dict[str, Any]) -> bool:
+    """Only remove an old role when state or an exact known release proves ownership."""
+    digest = sha256_text(path.read_text(encoding="utf-8"))
+    record = state.get("managedProfiles", {}).get(role)
+    if isinstance(record, dict) and record.get("managed") is True and record.get("sha256") == digest:
+        return True
+    return digest in KNOWN_MANAGED_PROFILE_HASHES.get(role, set()) or digest == LEGACY_REMOVALS.get(path.name)
 
 
 def _systemd_units(home: Path, codex_executable: str | None) -> dict[Path, str]:
@@ -487,16 +516,17 @@ def _install_files(
         config: merged_config,
         agents_doc: merge_agents(agents_text),
         home / "model-routing" / "model_router.py": ENGINE_FILE.read_text(encoding="utf-8"),
+        home / "model-routing" / "radar_source.py": RADAR_SOURCE_FILE.read_text(encoding="utf-8"),
         **_systemd_units(home, shutil.which("codex")),
     }
     warnings: list[str] = []
-    managed_profiles = dict(state.get("managedProfiles", {}))
+    managed_profiles: dict[str, Any] = {}
     selections = (
         state.get("catalogSelection")
         if isinstance(state.get("catalogSelection"), dict)
         else DEFAULT_SELECTIONS
     )
-    active_profiles = dict(state.get("activeProfiles", {}))
+    active_profiles: dict[str, Any] = {}
     for worker in WORKERS:
         role = worker.removesuffix(".toml")
         source = ROOT / "agents" / worker
@@ -527,9 +557,10 @@ def _install_files(
                 "reason": "pre-existing-custom-profile",
             }
             active_profiles[role] = profile_selection(target)
-    for name, digest in LEGACY_REMOVALS.items():
+    for name in LEGACY_REMOVALS:
         target = agents_dir / name
-        if target.exists() and sha256_text(target.read_text(encoding="utf-8")) == digest:
+        role = target.stem
+        if target.exists() and _legacy_profile_is_managed(target, role, state):
             desired[target] = None
         elif target.exists():
             warnings.append(f"preserved custom legacy-named profile {target}")

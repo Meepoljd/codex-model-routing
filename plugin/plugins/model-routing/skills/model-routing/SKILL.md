@@ -7,7 +7,7 @@ description: Plan task boundaries and dependencies, choose the lowest-cost Codex
 
 This skill applies the routing workflow. A separate installed refresher maintains the worker profiles from the logged-in Codex `model/list` catalog without making inference calls. Preserve the user's scope and explicit model, delegation, and analysis-only instructions. Profile changes take effect in a new task and do not change a running session.
 
-Before routing, use the current `luna_worker`, `sol_worker`, and `astra_worker` profiles in the Codex agents directory as the source of model IDs. When exact status matters, run the installed `model_router.py ... status` command documented by this package and distinguish `catalogSelection` from `activeProfiles`. Do not copy a model ID from this skill. The refresher recognizes future numeric versions only within the known Luna, Sol, and Astra families; it conservatively ignores unknown families, hidden or specialty entries, unsupported reasoning efforts, and explicit tool-capability failures.
+Before routing, use the current `routine_worker`, `complex_worker`, and `frontier_worker` profiles in the Codex agents directory as the source of model IDs. When exact status matters, run the installed `model_router.py ... status` command documented by this package and distinguish `catalogSelection` from `activeProfiles`. Do not copy a model ID from this skill. The refresher intersects native catalog entries with Codex Radar evidence across model families; current RadarBench accepts only complete model/effort points sharing one binding fingerprint and needs at least three complete candidates, so unmeasured new models do not block measured ones. It defaults to low, medium, and high effort only.
 
 ## Plan before assigning
 
@@ -25,10 +25,10 @@ For each delegated task record an ID, deliverable, absolute paths (or no files),
 
 Route each task by type, ambiguity, coupling, risk, verifiability, and root-cause uncertainty. Evaluate Astra, then Sol, then Luna; high-risk rules take priority. Do not use prompt length or file count as proxies. Judge coupled risks together rather than splitting a risky task into apparently routine pieces.
 
-1. **Astra (`astra_worker`):** an explicit task selection of `gpt6`, `gpt-6`, `GPT-6`, `GPT-6 Astra`, or the active Astra-family model; the hardest end-to-end engineering; multiple interacting architectural uncertainties; evidenced repeated Sol failures; exceptional cross-system complexity and failure cost making Sol likely insufficient; or extremely complex synthesis/implementation. Tokens in quoted text, policy, documentation, status history, or rationale are not user model selections. Ordinary architecture, security, and concurrency stay at Sol.
-2. **Sol (`sol_worker`):** architecture; unclear root cause; high ambiguity, coupling, or risk; concurrency, deadlocks, lock ordering, cancellation safety, distributed coordination; security-sensitive design or critical behavior; deep performance diagnosis; destructive migrations; or repeated Luna failures.
-3. **Luna (`luna_worker`):** routine engineering, multi-file features/refactors, API/data-model changes, test design, moderate debugging, bounded configuration fixes, and cross-module analysis without architectural uncertainty or high risk.
-4. **Root:** the light coordination work described above. A fresh managed install starts on the current Luna-family model at low reasoning, while existing root selections remain explicit pins. Delegate substantial implementation and route analysis by its actual difficulty.
+1. **Frontier (`frontier_worker`):** explicit `gpt6`, `gpt-6`, `GPT-6`, or `GPT-6 Astra` means `gpt-6-astra` specifically; otherwise reserve this role for the hardest work, interacting uncertainty, evidence-backed repeated complex failures, or exceptional failure cost. Tokens in quoted text, policy, documentation, status history, or rationale are not user model selections.
+2. **Complex (`complex_worker`):** architecture; unclear root cause; high ambiguity, coupling, or risk; concurrency; distributed coordination; security-sensitive behavior; deep performance diagnosis; destructive migrations; or repeated routine failures.
+3. **Routine (`routine_worker`):** bounded, clear-cause, low-risk implementation and analysis.
+4. **Root:** the light coordination work described above. Existing root selections remain explicit pins. Delegate substantial implementation and route analysis by its actual difficulty.
 
 ## Handoff and native execution
 

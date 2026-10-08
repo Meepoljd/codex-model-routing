@@ -22,22 +22,44 @@ import time
 import tomllib
 from typing import Any, Iterator, Mapping, Sequence
 
+from radar_source import (
+    EvidencePoint,
+    EvidenceSnapshot,
+    RadarSource,
+    RadarSourceError,
+    evidence_from_mapping,
+    snapshot_digest,
+)
+
 try:  # pragma: no cover - exercised on Unix CI; fallback keeps the script portable.
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None
 
 
-STATE_VERSION = 1
+STATE_VERSION = 2
+SUPPORTED_STATE_VERSIONS = frozenset({1, 2})
 DEFAULT_TTL = timedelta(hours=6)
-ROLES: dict[str, dict[str, str]] = {
-    "luna_worker": {"family": "luna", "effort": "medium"},
-    "sol_worker": {"family": "sol", "effort": "high"},
-    "astra_worker": {"family": "astra", "effort": "high"},
+ROLES: dict[str, dict[str, Any]] = {
+    "routine_worker": {
+        "responsibility": "bounded, deterministic, readily verified engineering",
+        "qualityRatio": 0.70,
+    },
+    "complex_worker": {
+        "responsibility": "coupled, ambiguous, or high-risk engineering",
+        "qualityRatio": 0.90,
+    },
+    "frontier_worker": {
+        "responsibility": "the hardest work after evidence-backed lower-tier failure",
+        "qualityRatio": 1.0,
+    },
 }
-ROOT_ROLE = {"family": "luna", "effort": "low"}
-MODEL_PATTERN = re.compile(r"^gpt-(?P<version>[0-9]+(?:\.[0-9]+)*)-(?P<family>luna|sol|astra)$")
+ROOT_ROLE = {"responsibility": "coordination and lightweight work", "follows": "routine_worker"}
+DEFAULT_ALLOWED_EFFORTS = frozenset({"low", "medium", "high"})
+MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+EFFORT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 MANAGED_ROOT_MARKER = "# codex-model-routing:managed-root"
+EFFORT_ORDER = {"none": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6, "ultra": 7}
 
 
 class RoutingError(RuntimeError):
@@ -47,9 +69,8 @@ class RoutingError(RuntimeError):
 @dataclass(frozen=True)
 class Candidate:
     model: str
-    family: str
-    version: tuple[int, ...]
     efforts: frozenset[str]
+    catalog_index: int
 
 
 def utc_now() -> datetime:
@@ -70,8 +91,12 @@ def _capability_explicitly_false(item: Mapping[str, Any]) -> bool:
     )
 
 
-def normalize_catalog(items: Sequence[object]) -> list[Candidate]:
-    """Validate model/list records and retain conservative routing candidates."""
+def normalize_catalog(
+    items: Sequence[object],
+    *,
+    allowed_efforts: frozenset[str] = DEFAULT_ALLOWED_EFFORTS,
+) -> list[Candidate]:
+    """Validate model/list records and retain safe, model-family-neutral candidates."""
     candidates: list[Candidate] = []
     seen: set[str] = set()
     for index, raw in enumerate(items):
@@ -81,7 +106,7 @@ def normalize_catalog(items: Sequence[object]) -> list[Candidate]:
         if any(key not in raw for key in required):
             raise RoutingError(f"model/list item {index} is missing required fields")
         model = raw["model"]
-        if not isinstance(model, str) or not model:
+        if not isinstance(model, str) or not MODEL_PATTERN.fullmatch(model):
             raise RoutingError(f"model/list item {index} has an invalid model token")
         if model in seen:
             raise RoutingError(f"model/list returned duplicate model token {model!r}")
@@ -95,52 +120,204 @@ def normalize_catalog(items: Sequence[object]) -> list[Candidate]:
         for effort in raw_efforts:
             if not isinstance(effort, Mapping) or not isinstance(effort.get("reasoningEffort"), str):
                 raise RoutingError(f"model/list item {model!r} has an invalid reasoning effort")
-            efforts.add(effort["reasoningEffort"])
+            effort_name = effort["reasoningEffort"]
+            if not EFFORT_PATTERN.fullmatch(effort_name):
+                raise RoutingError(f"model/list item {model!r} has an unsafe reasoning effort")
+            efforts.add(effort_name)
 
-        match = MODEL_PATTERN.fullmatch(model)
         if (
-            not match
-            or raw["hidden"]
+            raw["hidden"]
             or raw.get("modelSpecialty") is not None
+            or raw.get("special") is True
+            or raw.get("isSpecial") is True
             or _capability_explicitly_false(raw)
         ):
+            continue
+        usable_efforts = efforts & allowed_efforts
+        if not usable_efforts:
             continue
         candidates.append(
             Candidate(
                 model=model,
-                family=match.group("family"),
-                version=tuple(int(part) for part in match.group("version").split(".")),
-                efforts=frozenset(efforts),
+                efforts=frozenset(usable_efforts),
+                catalog_index=index,
             )
         )
     return candidates
 
 
-def select_models(items: Sequence[object]) -> dict[str, dict[str, str]]:
-    candidates = normalize_catalog(items)
+def _catalog_exclusions(
+    items: Sequence[object], allowed_efforts: frozenset[str]
+) -> list[dict[str, str]]:
+    exclusions: list[dict[str, str]] = []
+    for raw in items:
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("model"), str):
+            continue  # normalize_catalog reports malformed records before this helper runs.
+        model = raw["model"]
+        reason: str | None = None
+        if raw.get("hidden") is True:
+            reason = "hidden"
+        elif raw.get("modelSpecialty") is not None or raw.get("special") is True or raw.get("isSpecial") is True:
+            reason = "specialty-model"
+        elif _capability_explicitly_false(raw):
+            reason = "tool-capability-disabled"
+        else:
+            efforts = {
+                effort.get("reasoningEffort")
+                for effort in raw.get("supportedReasoningEfforts", [])
+                if isinstance(effort, Mapping)
+            }
+            if not (efforts & allowed_efforts):
+                reason = "no-allowed-effort"
+        if reason:
+            exclusions.append({"model": model, "reason": reason})
+    return exclusions
+
+
+def _effort_key(effort: str) -> tuple[int, str]:
+    return (EFFORT_ORDER.get(effort, len(EFFORT_ORDER)), effort)
+
+
+def _point_tie_key(point: EvidencePoint) -> tuple[int, str, str]:
+    effort_rank, effort_name = _effort_key(point.effort)
+    return (effort_rank, effort_name, point.model)
+
+
+def _coerce_evidence(value: EvidenceSnapshot | Mapping[str, Any]) -> EvidenceSnapshot:
+    if isinstance(value, EvidenceSnapshot):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return evidence_from_mapping(value)
+        except RadarSourceError as exc:
+            raise RoutingError(str(exc)) from exc
+    raise RoutingError("routing evidence has an unsupported shape")
+
+
+def _select_models_with_evidence(
+    items: Sequence[object],
+    *,
+    evidence: EvidenceSnapshot | Mapping[str, Any] | None = None,
+    radar: RadarSource | None = None,
+    allowed_efforts: frozenset[str] = DEFAULT_ALLOWED_EFFORTS,
+) -> tuple[dict[str, dict[str, str]], EvidenceSnapshot, dict[str, Any]]:
+    candidates = normalize_catalog(items, allowed_efforts=allowed_efforts)
+    if not candidates:
+        raise RoutingError("catalog has no safe visible models with an allowed reasoning effort")
+    try:
+        snapshot = _coerce_evidence(evidence) if evidence is not None else (radar or RadarSource()).load(candidates)
+    except RadarSourceError as exc:
+        raise RoutingError(f"CodexRadar evidence unavailable: {exc}") from exc
+
+    candidate_pairs = {(candidate.model, effort) for candidate in candidates for effort in candidate.efforts}
+    points: list[EvidencePoint] = []
+    point_pairs: set[tuple[str, str]] = set()
+    exclusions = _catalog_exclusions(items, allowed_efforts)
+    for point in snapshot.points:
+        pair = (point.model, point.effort)
+        if pair in point_pairs:
+            raise RoutingError(f"routing evidence repeats {point.model}@{point.effort}")
+        point_pairs.add(pair)
+        if pair not in candidate_pairs:
+            exclusions.append({"model": point.model, "effort": point.effort, "reason": "not-in-native-catalog"})
+            continue
+        if not isinstance(point.quality, (int, float)) or not float("-inf") < point.quality < float("inf"):
+            exclusions.append({"model": point.model, "effort": point.effort, "reason": "non-finite-quality"})
+            continue
+        points.append(point)
+    for model, effort in sorted(candidate_pairs - point_pairs):
+        exclusions.append({"model": model, "effort": effort, "reason": "no-qualified-radar-evidence"})
+    if not points:
+        raise RoutingError("CodexRadar evidence has no candidates present in the native catalog")
+
+    top_quality = max(point.quality for point in points)
+    if top_quality <= 0:
+        raise RoutingError("CodexRadar evidence has no positive-quality candidate")
     selected: dict[str, dict[str, str]] = {}
+    decisions: dict[str, Any] = {}
     for role, requirement in ROLES.items():
-        eligible = [
-            item
-            for item in candidates
-            if item.family == requirement["family"] and requirement["effort"] in item.efforts
-        ]
+        ratio = float(requirement["qualityRatio"])
+        floor = top_quality * ratio
+        eligible = [point for point in points if point.quality >= floor]
         if not eligible:
-            raise RoutingError(
-                f"catalog has no visible {requirement['family']} model supporting "
-                f"{requirement['effort']} reasoning"
-            )
-        choice = max(eligible, key=lambda item: item.version)
-        selected[role] = {"model": choice.model, "effort": requirement["effort"]}
-    root_eligible = [
-        item
-        for item in candidates
-        if item.family == ROOT_ROLE["family"] and ROOT_ROLE["effort"] in item.efforts
-    ]
-    if not root_eligible:
-        raise RoutingError("catalog has no visible luna model supporting low reasoning")
-    root = max(root_eligible, key=lambda item: item.version)
-    selected["root"] = {"model": root.model, "effort": ROOT_ROLE["effort"]}
+            raise RoutingError(f"routing evidence has no candidate for {role}")
+        if ratio == 1.0:
+            best_quality = max(point.quality for point in eligible)
+            pool = [point for point in eligible if point.quality == best_quality]
+            if snapshot.cost_mode == "verified-cost":
+                basis = "maximum-quality-then-verified-cost"
+                latency_comparable = all(point.latency_minutes is not None for point in pool)
+                choice = min(
+                    pool,
+                    key=lambda point: (
+                        point.cost_usd,
+                        point.latency_minutes if latency_comparable else 0,
+                        _point_tie_key(point),
+                    ),
+                )
+            else:
+                basis = "maximum-quality"
+                choice = min(pool, key=_point_tie_key)
+        else:
+            if snapshot.cost_mode == "verified-cost":
+                basis = "verified-cost-within-quality-floor"
+                latency_comparable = all(point.latency_minutes is not None for point in eligible)
+                choice = min(
+                    eligible,
+                    key=lambda point: (
+                        point.cost_usd,
+                        point.latency_minutes if latency_comparable else 0,
+                        point.quality,
+                        _point_tie_key(point),
+                    ),
+                )
+            else:
+                basis = "lowest-quality-meeting-floor"
+                lowest_quality = min(point.quality for point in eligible)
+                choice = min(
+                    (point for point in eligible if point.quality == lowest_quality),
+                    key=_point_tie_key,
+                )
+        selected[role] = {"model": choice.model, "effort": choice.effort}
+        decisions[role] = {
+            "model": choice.model,
+            "effort": choice.effort,
+            "quality": choice.quality,
+            "qualityRatio": ratio,
+            "qualityFloor": floor,
+            "sampleCount": choice.sample_count,
+            "coverage": choice.coverage,
+            "requiredTasks": choice.required_tasks,
+            "costUsd": choice.cost_usd,
+            "costSamples": choice.cost_samples,
+            "latencyMinutes": choice.latency_minutes,
+            "latencySamples": choice.latency_samples,
+            "selectionBasis": basis,
+        }
+    selected["root"] = dict(selected["routine_worker"])
+    decisions["root"] = {**decisions["routine_worker"], "follows": "routine_worker"}
+    decision_evidence = snapshot.as_state()
+    decision_evidence["thresholds"] = {
+        **decision_evidence.get("thresholds", {}),
+        "roleQualityRatios": {role: requirement["qualityRatio"] for role, requirement in ROLES.items()},
+        "allowedEfforts": sorted(allowed_efforts, key=_effort_key),
+    }
+    decision_evidence["exclusions"] = [*decision_evidence.get("exclusions", []), *exclusions]
+    decision_evidence["roleDecisions"] = decisions
+    decision_evidence["evidenceSha256"] = snapshot_digest(snapshot)
+    return selected, snapshot, decision_evidence
+
+
+def select_models(
+    items: Sequence[object],
+    *,
+    evidence: EvidenceSnapshot | Mapping[str, Any] | None = None,
+    radar: RadarSource | None = None,
+    allowed_efforts: frozenset[str] = DEFAULT_ALLOWED_EFFORTS,
+) -> dict[str, dict[str, str]]:
+    selected, _, _ = _select_models_with_evidence(
+        items, evidence=evidence, radar=radar, allowed_efforts=allowed_efforts
+    )
     return selected
 
 
@@ -351,7 +528,13 @@ def read_state(home: Path) -> dict[str, Any] | None:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RoutingError(f"routing state is invalid: {exc}") from exc
-    if not isinstance(value, dict) or value.get("version") != STATE_VERSION:
+    version = value.get("version") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in SUPPORTED_STATE_VERSIONS
+    ):
         raise RoutingError("routing state has an unsupported format")
     return value
 
@@ -468,14 +651,31 @@ def transactional_write(home: Path, desired: Mapping[Path, str | None]) -> Path 
     return backup
 
 
+def _record_degraded_refresh(home: Path, state: Mapping[str, Any], reason: str) -> None:
+    """Record a failed attempt without replacing any last-good decision or profile."""
+    degraded = dict(state)
+    degraded["version"] = STATE_VERSION
+    degraded["refreshStatus"] = {
+        "status": "degraded",
+        "attemptedAt": utc_now().isoformat(),
+        "reason": reason,
+        "preservedLastGood": True,
+    }
+    state_path = home / "model-routing" / "state.json"
+    transactional_write(home, {state_path: json.dumps(degraded, indent=2, sort_keys=True) + "\n"})
+
+
 def refresh(
     home: Path,
     templates: Path,
     *,
     catalog: Sequence[object] | None = None,
+    evidence: EvidenceSnapshot | Mapping[str, Any] | None = None,
+    radar: RadarSource | None = None,
     timeout: float = 15.0,
     if_stale: bool = False,
     ttl: timedelta = DEFAULT_TTL,
+    allowed_efforts: frozenset[str] = DEFAULT_ALLOWED_EFFORTS,
 ) -> dict[str, Any]:
     home = home.expanduser().absolute()
     with routing_lock(home):
@@ -490,13 +690,24 @@ def refresh(
             if utc_now() - last < ttl:
                 return state
 
-        if catalog is None:
-            app_env = os.environ.copy()
-            app_env["CODEX_HOME"] = str(home)
-            catalog_items = discover_catalog(timeout=timeout, env=app_env)
-        else:
-            catalog_items = list(catalog)
-        selected = select_models(catalog_items)
+        try:
+            if catalog is None:
+                app_env = os.environ.copy()
+                app_env["CODEX_HOME"] = str(home)
+                catalog_items = discover_catalog(timeout=timeout, env=app_env)
+            else:
+                catalog_items = list(catalog)
+            selected, _, decision_evidence = _select_models_with_evidence(
+                catalog_items,
+                evidence=evidence,
+                radar=radar or RadarSource(total_timeout=timeout),
+                allowed_efforts=allowed_efforts,
+            )
+        except (RoutingError, OSError, ValueError) as exc:
+            _record_degraded_refresh(home, state, str(exc))
+            if isinstance(exc, RoutingError):
+                raise
+            raise RoutingError(str(exc)) from exc
         managed = state.setdefault("managedProfiles", {})
         desired: dict[Path, str] = {}
         new_hashes: dict[str, str] = {}
@@ -546,6 +757,12 @@ def refresh(
                 "catalogSelection": selected,
                 "activeProfiles": active_profiles,
                 "catalogSha256": sha256_text(json.dumps(catalog_items, sort_keys=True, separators=(",", ":"))),
+                "evidence": decision_evidence,
+                "refreshStatus": {
+                    "status": "current",
+                    "attemptedAt": now,
+                    "sourceKind": decision_evidence["sourceKind"],
+                },
                 "managedRoot": root_state,
             }
         )
