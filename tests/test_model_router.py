@@ -99,6 +99,7 @@ class SelectionTest(unittest.TestCase):
             ),
         )
         self.assertEqual(selected["routine_worker"], {"model": "future:quark", "effort": "low"})
+        self.assertEqual(selected["simple_worker"], {"model": "future:quark", "effort": "low"})
         self.assertEqual(selected["complex_worker"], {"model": "model_2027/orbit", "effort": "medium"})
         self.assertEqual(selected["frontier_worker"], {"model": "acme-nebula", "effort": "high"})
         self.assertEqual(selected["root"], selected["routine_worker"])
@@ -112,8 +113,21 @@ class SelectionTest(unittest.TestCase):
                 ("brand-new-model", "high", 100),
             ),
         )
-        self.assertEqual([selected[role]["model"] for role in ROLES], ["brand-new-model"] * 3)
-        self.assertEqual([selected[role]["effort"] for role in ROLES], ["low", "medium", "high"])
+        self.assertEqual([selected[role]["model"] for role in ROLES], ["brand-new-model"] * 4)
+        self.assertEqual([selected[role]["effort"] for role in ROLES], ["low", "low", "medium", "high"])
+
+    def test_simple_uses_lowest_quality_meeting_40_percent_floor(self):
+        selected = select_models(
+            [item("simple", ("low",)), item("routine", ("medium",)), item("frontier", ("high",))],
+            evidence=evidence(
+                ("simple", "low", 40),
+                ("routine", "medium", 70),
+                ("frontier", "high", 100),
+            ),
+        )
+        self.assertEqual(selected["simple_worker"], {"model": "simple", "effort": "low"})
+        self.assertEqual(selected["routine_worker"], {"model": "routine", "effort": "medium"})
+        self.assertEqual(selected["root"], selected["routine_worker"])
 
     def test_default_policy_never_automatically_selects_xhigh_max_or_ultra(self):
         selected = select_models(

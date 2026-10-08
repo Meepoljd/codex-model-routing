@@ -44,6 +44,7 @@ WORKERS = tuple(f"{role}.toml" for role in ROLES)
 START = "<!-- codex-model-routing:begin -->"
 END = "<!-- codex-model-routing:end -->"
 DEFAULT_SELECTIONS = {
+    "simple_worker": {"model": "gpt-5.6-terra", "effort": "low"},
     "routine_worker": {"model": "gpt-6-luna", "effort": "medium"},
     "complex_worker": {"model": "gpt-6.1-sol", "effort": "high"},
     "frontier_worker": {"model": "gpt-6-astra", "effort": "high"},

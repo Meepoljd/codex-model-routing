@@ -7,7 +7,7 @@ description: Plan task boundaries and dependencies, choose the lowest-cost Codex
 
 This skill applies the routing workflow. A separate installed refresher maintains the worker profiles from the logged-in Codex `model/list` catalog without making inference calls. Preserve the user's scope and explicit model, delegation, and analysis-only instructions. Profile changes take effect in a new task and do not change a running session.
 
-Before routing, use the current `routine_worker`, `complex_worker`, and `frontier_worker` profiles in the Codex agents directory as the source of model IDs. When exact status matters, run the installed `model_router.py ... status` command documented by this package and distinguish `catalogSelection` from `activeProfiles`. Do not copy a model ID from this skill. The refresher intersects native catalog entries with Codex Radar evidence across model families; current RadarBench accepts only complete model/effort points sharing one binding fingerprint and needs at least three complete candidates, so unmeasured new models do not block measured ones. It defaults to low, medium, and high effort only.
+Before routing, use the current `simple_worker`, `routine_worker`, `complex_worker`, and `frontier_worker` profiles in the Codex agents directory as the source of model IDs. When exact status matters, run the installed `model_router.py ... status` command documented by this package and distinguish `catalogSelection` from `activeProfiles`. Do not copy a model ID from this skill. The refresher intersects native catalog entries with Codex Radar evidence across model families; current RadarBench accepts only complete model/effort points sharing one binding fingerprint and needs at least three complete candidates, so unmeasured new models do not block measured ones. It defaults to low, medium, and high effort only.
 
 ## Plan before assigning
 
@@ -23,12 +23,13 @@ For each delegated task record an ID, deliverable, absolute paths (or no files),
 
 ## Tiers
 
-Route each task by type, ambiguity, coupling, risk, verifiability, and root-cause uncertainty. Evaluate Astra, then Sol, then Luna; high-risk rules take priority. Do not use prompt length or file count as proxies. Judge coupled risks together rather than splitting a risky task into apparently routine pieces.
+Route each task by type, ambiguity, coupling, risk, verifiability, and root-cause uncertainty. Evaluate frontier, complex, routine, then simple; high-risk rules take priority. Do not use prompt length or file count as proxies. Judge coupled risks together rather than splitting a risky task into apparently routine pieces.
 
-1. **Frontier (`frontier_worker`):** explicit `gpt6`, `gpt-6`, `GPT-6`, or `GPT-6 Astra` means `gpt-6-astra` specifically; otherwise reserve this role for the hardest work, interacting uncertainty, evidence-backed repeated complex failures, or exceptional failure cost. Tokens in quoted text, policy, documentation, status history, or rationale are not user model selections.
+1. **Frontier (`frontier_worker`):** reserve this role for the hardest work, interacting uncertainty, evidence-backed repeated complex failures, or exceptional failure cost. Explicit `gpt6`, `gpt-6`, `GPT-6`, or `GPT-6 Astra` means an exact `gpt-6-astra` override, not this dynamic role. Tokens in quoted text, policy, documentation, status history, or rationale are not user model selections.
 2. **Complex (`complex_worker`):** architecture; unclear root cause; high ambiguity, coupling, or risk; concurrency; distributed coordination; security-sensitive behavior; deep performance diagnosis; destructive migrations; or repeated routine failures.
-3. **Routine (`routine_worker`):** bounded, clear-cause, low-risk implementation and analysis.
-4. **Root:** the light coordination work described above. Existing root selections remain explicit pins. Delegate substantial implementation and route analysis by its actual difficulty.
+3. **Routine (`routine_worker`):** ordinary features, refactors, test work, and moderate debugging when cause and impact are clear.
+4. **Simple (`simple_worker`):** mechanical edits, formatting, and clearly scoped tiny fixes. Escalate to routine if focused verification fails or scope expands.
+5. **Root:** the light coordination work described above. Existing root selections remain explicit pins and continue to follow routine. Delegate substantial implementation and route analysis by its actual difficulty.
 
 ## Handoff and native execution
 
@@ -69,6 +70,6 @@ The main conversation should expose the plan, task status, phase outputs, eviden
 
 Workers return recommendations; root revises the plan and decides escalation. Stop and recommend Sol when Luna work becomes architectural, the cause remains unclear, concurrency/distributed or security concerns arise, reasonable attempts repeatedly fail, or behavior impact is unclear.
 
-Astra handoffs must contain Sol attempts, evidence, failure reasons, and unresolved questions. When direct routing is justified by an explicit Astra request or exceptional criteria, state that no Sol attempt occurred and explain why. Never fabricate attempts, repeat a failed approach without a new hypothesis, or enlarge scope because the model is stronger.
+Frontier handoffs must contain complex-worker attempts, evidence, failure reasons, and unresolved questions. When direct frontier routing is justified by exceptional criteria, state why. An explicit Astra request is an exact-model override, not a frontier handoff. Never fabricate attempts, repeat a failed approach without a new hypothesis, or enlarge scope because the model is stronger.
 
 TOML profiles cannot make unavailable models available. Discovery failures keep the last-good profiles, and a user-modified or pre-existing custom profile stays unmanaged until the user explicitly replaces it. Follow the active runtime's supported mechanisms and disclose unavailable roles/models. Start a new Codex task after installing or refreshing this plugin. Project instructions and explicit user directions may override this policy.

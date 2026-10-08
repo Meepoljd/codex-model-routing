@@ -58,8 +58,9 @@ class InstallerIntegrationTest(unittest.TestCase):
             self.assertIn("Installed: no changes", second.stdout)
             self.assertEqual((home / "model-routing/state.json").read_text(encoding="utf-8"), state_before)
 
-    def test_packaged_workers_are_three_dynamic_roles_and_plugin_copy_matches(self):
+    def test_packaged_workers_are_four_dynamic_roles_and_plugin_copy_matches(self):
         expected = {
+            "simple_worker.toml": ("gpt-5.6-terra", "low"),
             "routine_worker.toml": ("gpt-6-luna", "medium"),
             "complex_worker.toml": ("gpt-6.1-sol", "high"),
             "frontier_worker.toml": ("gpt-6-astra", "high"),
@@ -99,7 +100,9 @@ enabled = false
             home = Path(directory) / ".codex"
             (home / "agents").mkdir(parents=True)
             custom = 'name = "routine_worker"\nmodel = "my-model"\nmodel_reasoning_effort = "high"\n'
+            simple_custom = 'name = "simple_worker"\nmodel = "my-simple-model"\nmodel_reasoning_effort = "low"\n'
             (home / "agents/routine_worker.toml").write_text(custom, encoding="utf-8")
+            (home / "agents/simple_worker.toml").write_text(simple_custom, encoding="utf-8")
             (home / "AGENTS.md").write_text(
                 "# Mine\n\nkeep before\n\n## Model Routing Policy\nold\n\n## Other\nkeep after\n",
                 encoding="utf-8",
@@ -107,6 +110,7 @@ enabled = false
             installed = run(home)
             self.assertEqual(installed.returncode, 0, installed.stderr)
             self.assertEqual((home / "agents/routine_worker.toml").read_text(), custom)
+            self.assertEqual((home / "agents/simple_worker.toml").read_text(), simple_custom)
             document = (home / "AGENTS.md").read_text()
             self.assertIn("keep before", document)
             self.assertIn("## Other\nkeep after", document)
@@ -115,6 +119,7 @@ enabled = false
             removed = run(home, "--uninstall")
             self.assertEqual(removed.returncode, 0, removed.stderr)
             self.assertEqual((home / "agents/routine_worker.toml").read_text(), custom)
+            self.assertEqual((home / "agents/simple_worker.toml").read_text(), simple_custom)
             self.assertNotIn("codex-model-routing:begin", (home / "AGENTS.md").read_text())
 
     def test_malformed_config_is_non_destructive(self):
@@ -201,6 +206,32 @@ enabled = false
             migrated = json.loads((runtime / "state.json").read_text())
             self.assertIn("routine_worker", migrated["catalogSelection"])
             self.assertNotIn("luna_worker", migrated["managedProfiles"])
+
+    def test_existing_v2_three_role_state_gains_managed_simple_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / ".codex"
+            runtime = home / "model-routing"
+            runtime.mkdir(parents=True)
+            state = {
+                "version": 2,
+                "catalogSelection": {
+                    "routine_worker": {"model": "routine", "effort": "low"},
+                    "complex_worker": {"model": "complex", "effort": "medium"},
+                    "frontier_worker": {"model": "frontier", "effort": "high"},
+                    "root": {"model": "routine", "effort": "low"},
+                },
+                "managedProfiles": {},
+                "managedRoot": {"managed": False},
+            }
+            (runtime / "state.json").write_text(json.dumps(state), encoding="utf-8")
+            result = run(home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            migrated = json.loads((runtime / "state.json").read_text())
+            self.assertEqual(
+                migrated["catalogSelection"]["simple_worker"],
+                {"model": "gpt-5.6-terra", "effort": "low"},
+            )
+            self.assertTrue((home / "agents/simple_worker.toml").is_file())
 
     def test_uninstall_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:

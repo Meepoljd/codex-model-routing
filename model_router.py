@@ -41,6 +41,10 @@ STATE_VERSION = 2
 SUPPORTED_STATE_VERSIONS = frozenset({1, 2})
 DEFAULT_TTL = timedelta(hours=6)
 ROLES: dict[str, dict[str, Any]] = {
+    "simple_worker": {
+        "responsibility": "mechanical edits, formatting, and clearly scoped tiny fixes",
+        "qualityRatio": 0.40,
+    },
     "routine_worker": {
         "responsibility": "bounded, deterministic, readily verified engineering",
         "qualityRatio": 0.70,

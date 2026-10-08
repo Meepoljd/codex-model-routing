@@ -14,13 +14,13 @@ class ModelRoutingPolicyTest(unittest.TestCase):
         cls.skill = (ROOT / "plugin/plugins/model-routing/skills/model-routing/SKILL.md").read_text(encoding="utf-8")
 
     def test_policy_has_generic_roles_and_session_boundary(self):
-        for role in ("routine_worker", "complex_worker", "frontier_worker"):
+        for role in ("simple_worker", "routine_worker", "complex_worker", "frontier_worker"):
             self.assertIn(role, self.policy)
         self.assertIn("new Codex task", self.policy)
         self.assertIn("activeProfiles", self.policy)
 
     def test_policy_documents_radar_thresholds_and_limits(self):
-        for text in ("codexradar.com", "70%", "90%", "quality-only", "xhigh, max, or ultra"):
+        for text in ("codexradar.com", "40%", "70%", "90%", "quality-only", "xhigh, max, or ultra"):
             self.assertIn(text, self.policy)
         self.assertIn("30 samples", self.policy)
         self.assertIn("14 days", self.policy)
@@ -43,6 +43,7 @@ class ModelRoutingPolicyTest(unittest.TestCase):
         self.assertIn("activeProfiles", self.skill)
         self.assertIn("Codex Radar evidence", self.skill)
         self.assertIn("frontier_worker", self.skill)
+        self.assertIn("simple_worker", self.skill)
 
 
 if __name__ == "__main__":
