@@ -1,59 +1,33 @@
-# Codex 模型路由插件
+# Codex 自适应模型路由插件
 
 [English](README.en.md)
 
-先给出短计划，再决定由 Root 自己处理、交给一个 Worker，还是拆成多个有依赖关系的任务。每项工作按风险和不确定性选择 Luna、Sol 或 Astra；执行期间由 Root 汇报进度，最后整合证据。
+插件先按风险与不确定性规划和分配工作，再通过 Codex 原生 `spawn_agent` 使用 Luna、Sol 或 Astra Worker。独立刷新器从当前登录账号的原生 `model/list` catalog 维护 Worker 的模型 ID；它不读取认证文件，也不发起模型推理。
 
-## 工作流程
+## 路由与自动选择
 
-1. **先 plan**：明确目标、完成标准和已知约束，判断拆分是否能改善效率或质量。简单任务一句话即可；计划不额外增加审批步骤。
-2. **确定边界和依赖**：列出每项工作的交付物、负责路径、前置结果、负责人和验证方式。共享接口尚未确定时先调查；共享文件由一个 Worker 负责或串行修改。
-3. **再选档分配**：轻量搜索和总结由 Root 处理；较大的实现工作即使不适合拆分，也交给一个 Worker。只有相互独立且收益超过协调成本的工作才并行。
-4. **实际委派**：调用原生 `spawn_agent`，使用对应角色和最少必要上下文。交接包含已有证据、已做修改、验证结果、任务边界和升级背景。
-5. **持续汇报并整合**：Worker 回报阶段成果和阻塞；Root 在主会话更新任务状态与证据，等待必需结果并按依赖顺序整合，完成针对性验证后汇总。
+按 Astra → Sol → Luna 评估，高风险条件优先：
 
-例如，涉及根因未知的缺陷时，可以先安排 Sol 调查。待根因和接口明确，再将边界清楚的实现交给 Luna。不要提前启动依赖调查结果的实现，也不要为了多 Agent 而拆分高度耦合的工作。
-
-## 路由策略
-
-按 Astra → Sol → Luna 顺序评估，高风险条件优先。
-
-| 层级 | 适用工作 |
+| 角色 | 工作 |
 | --- | --- |
-| Astra · `astra_worker` | 明确要求 GPT-6 Astra；多个架构不确定性相互影响、极复杂任务，或有证据的 Sol 多次失败等例外情况 |
-| Sol · `sol_worker` | 架构、根因不明、高耦合或高风险、并发与分布式、安全敏感设计、深度性能诊断、破坏性迁移 |
-| Luna · `luna_worker` | 常规开发、功能和重构、API/数据模型变更、测试设计、中等复杂度排障、边界清楚的配置修改 |
-| Root · 推荐 Luna low | 理解需求、轻量搜索、简单总结、计划和协调；插件不会切换现有 Root 模型 |
+| `astra_worker` | 用户明确选择 GPT-6/Astra；有证据的 Sol 多次失败；多个架构不确定性相互影响；Sol 难以承担的极高失败代价和跨系统复杂度 |
+| `sol_worker` | 架构、根因不明、高耦合或高风险、并发与分布式、安全敏感行为、深度性能诊断、破坏性迁移 |
+| `luna_worker` | 常规工程、多文件功能和重构、API/数据模型变更、测试设计、中等排障和边界清楚的配置修改 |
+| Root | 理解需求、轻量搜索、简单总结、计划、协调与整合 |
 
-提示长度、文件数量和模型新旧不决定升级。“使用 GPT-6”或“使用高档模型”本身不等于指定 Astra。Worker 不自行委派或升级，由 Root 根据证据决定；直接使用 Astra 时说明原因及未经过 Sol 尝试的事实。
+提示长度、文件数量和模型新旧不决定升级。`gpt6`、`gpt-6`、`GPT-6` 或 `GPT-6 Astra` 是用户对当前任务的明确选择时路由 Astra；它们出现在文档、引用、状态历史或策略说明中不触发 Astra。
 
-## 能看到哪些执行细节
+刷新器只识别名称严格符合 Luna、Sol、Astra 的普通公开模型，按数值版本选最新值，并检查所需 reasoning effort。hidden、specialty、未知家族、字段异常和明确工具能力为 false 的条目会被剔除。它能自动跟进已知家族的未来 6.x/7.x 等版本，但不会猜测新的模型家族属于哪个角色。
 
-主会话展示的是**计划、任务状态、阶段产出、证据和最终汇总**。Worker 在发现关键事实、完成阶段、遇到阻塞或假设变化时，通过当前环境可用的父会话消息工具回报；Root 转述与任务有关的进展。
+当前随包 last-good 是：Luna `gpt-6-luna`/medium、Sol `gpt-6.1-sol`/high、Astra `gpt-6-astra`/high。实际值以 `~/.codex/agents/*_worker.toml` 为准，不要从文档复制静态 ID。
 
-| 想看到的内容 | 实际方式与边界 |
-| --- | --- |
-| 分工与进度 | Root 展示任务、负责 Worker、依赖和已收到的进度；等待超时不代表失败或完成 |
-| 关键操作和结果 | Worker 回报文件、命令结果摘要、验证和产物引用；Root 不把计划中的操作当成已执行 |
-| 更详细的线程记录 | 支持的客户端可打开 Worker 线程；Codex CLI 可用 `/agent` 切换查看，实际展示依版本而异 |
-| 每条工具事件自动出现在主会话 | 本插件没有这项机制；阶段消息需要 Worker 发送、Root 汇总 |
-| 完整私有推理 | 不提供；执行记录和解释性摘要不等于模型的内部推理全文 |
+## 执行流程与可见性
 
-客户端线程入口见官方 [Subagents 文档](https://learn.chatgpt.com/docs/agent-configuration/subagents)。工具语义、验证范围，以及与独立 Agents API 事件流的区别，见[可见性能力说明](plugins/model-routing/skills/model-routing/references/worker-visibility.md)。
+Root 先说明目标、拆分判断、依赖、负责路径和验证方式。高度耦合的工作交给一个合适 Worker；只有相互独立且收益超过协调成本的工作才并行。交接包含已有证据、修改、验证、边界与升级背景。
 
-## 实现原理
+Worker 在关键发现、阶段完成、阻塞或假设变化时回报；Root 在主会话展示计划、观察到的状态、证据和最终整合。支持的客户端可打开 Worker 线程，CLI 可用 `/agent`。本插件不复制所有工具事件，也不暴露私有推理。详细边界见[可见性说明](plugins/model-routing/skills/model-routing/references/worker-visibility.md)。
 
-这是**提示词驱动的协作策略**，不是拦截请求的确定性路由程序。它由以下部分组成：
-
-- `plugins/model-routing/skills/model-routing/SKILL.md`：计划、拆分、档位判断、交接和 Root 汇报规则；可通过 `$model-routing` 显式调用。
-- `agents/*_worker.toml`：声明模型、推理强度、职责边界和阶段回报要求；不能启用运行环境不支持的模型。
-- `install.sh` / `uninstall.sh`：注册本地插件市场、安装技能，备份并复制 Worker 配置；卸载时依据备份还原。
-
-插件未实现日志采集服务或独立看板。当前环境暴露哪些工具、客户端展示哪些内容，仍由 Codex 运行时决定。项目指令和明确的用户要求可覆盖插件策略；配置修改需在新任务中加载，不会热切换正在运行的会话。
-
-## 安装与卸载
-
-在仓库根目录执行：
+## 安装
 
 ```bash
 git clone git@github.com:Meepoljd/codex-model-routing.git
@@ -61,25 +35,39 @@ cd codex-model-routing/plugin
 bash install.sh
 ```
 
-安装后新开 Codex 任务，输入 `$model-routing` 使用。脚本复制三个 Worker 到 `~/.codex/agents/`，覆盖前备份；不会覆盖 `~/.codex/AGENTS.md` 或其它 Codex 配置。
+安装器会合并带标记的全局路由策略并保留 AGENTS.md 其它内容。已有 Root model/effort 被视为显式 pin；全新配置使用托管 Luna/low，用户后续修改会解除托管。同名自定义 Worker 不会被覆盖；只有缺失、上次由工具写入，或精确匹配本仓库旧版的文件会被管理。旧 Spark/Terra 仅在字节精确匹配旧托管文件时备份删除。
 
-仅手动注册技能时：
+Linux 上会尝试启用 systemd user timer，每六小时刷新一次。安装后的运行时位于 `~/.codex/model-routing/`，不依赖 checkout 或插件 cache。其它平台可运行手动命令。安装或刷新后新开任务，现有会话不会热加载。
+
+## 状态、刷新和排错
 
 ```bash
-codex plugin marketplace add /绝对路径/codex-model-routing/plugin
-codex plugin add model-routing@model-routing
+python3 ~/.codex/model-routing/model_router.py --codex-home ~/.codex status
+python3 ~/.codex/model-routing/model_router.py --codex-home ~/.codex refresh
 ```
 
-这两条命令不会执行本仓库安装脚本中的 Worker 复制步骤；完整安装请使用 `install.sh`。
+状态中的 `catalogSelection` 是推荐值，`activeProfiles` 是实际 profile；自定义文件显示 `managed: false`。分页、超时、空 catalog、格式异常或角色缺失都会使刷新失败并保持 last-good 配置。
 
-在 `plugin/` 目录运行 `bash uninstall.sh` 卸载。脚本依据最近的匹配备份还原 Worker，安装前不存在的对应文件会被删除；没有匹配备份时保留 Worker 文件。备份位于 `~/.codex/backups/model-routing-plugin-<时间戳>/`。
+```bash
+systemctl --user status codex-model-routing.timer
+systemctl --user start codex-model-routing.service
+journalctl --user -u codex-model-routing.service --since today
+```
 
-## 如何 Hack / 扩展
+如果同名 marketplace 已指向其它路径，安装器会停止并显示检查/修复命令，不会删除或悄悄替换它。插件内容更新后需要使用官方 cachebuster 更新流程重新安装，并在新任务中验证。
 
-- **改计划和拆分逻辑**：编辑技能的 `Plan before assigning`，同时保持交接字段与 Root 汇报约定一致。不要将“必须先计划”误写成“必须多 Worker”。
-- **改档位或模型**：同步编辑 `Tiers` 和对应 TOML；保留风险优先的判断顺序，核对运行时支持的模型和推理强度。
-- **改进度展示**：修改 Worker 回报指令与技能的 `Visible progress and integration`。新增日志 UI/API 属于额外实现，不能仅靠描述宣称支持。
-- **新增 Worker**：同步修改档位、交接、安装脚本备份/复制，以及卸载脚本还原逻辑。
-- **验证**：先检查 Markdown 引用、TOML/JSON 和安装路径一致性。需要运行验证时，在临时配置环境和新会话中检查轻量任务不滥拆、耦合任务只用一个合适 Worker、独立任务按依赖分配，以及阶段回报确实到达 Root。未实测的行为要标明。
+## 卸载
 
-不要将个人配置、凭据、hooks、项目路径或会话记录打包进插件。
+```bash
+bash uninstall.sh
+```
+
+卸载会移除插件、停用 timer、删除仍由工具管理的 profile 和策略块；用户修改或预先存在的自定义 profile 保留。每次写入前的备份位于 `~/.codex/backups/model-routing-refresh-*`。
+
+## 开发验证
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+修改技能后运行 skill `quick_validate.py`，交付插件前运行 `validate_plugin.py`。不要打包个人配置、凭据、hooks、项目路径或会话记录。

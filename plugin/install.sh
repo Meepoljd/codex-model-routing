@@ -1,53 +1,60 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$PLUGIN_ROOT/.." && pwd)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-BACKUP_ROOT="$CODEX_HOME/backups/model-routing-plugin-$(date +%Y%m%dT%H%M%S)"
+export CODEX_HOME
 
 if ! command -v codex >/dev/null 2>&1; then
   echo "codex CLI was not found on PATH." >&2
   exit 1
 fi
 
-mkdir -p "$CODEX_HOME/agents" "$BACKUP_ROOT/agents"
-for name in luna_worker sol_worker astra_worker; do
-  target="$CODEX_HOME/agents/$name.toml"
-  if [[ -e "$target" ]]; then
-    cp -p "$target" "$BACKUP_ROOT/agents/$name.toml"
-    : > "$BACKUP_ROOT/agents/$name.toml.existed"
-  fi
-done
-printf '%s\n' "$PLUGIN_ROOT" > "$BACKUP_ROOT/marketplace-path"
-printf '%s\n' "$CODEX_HOME" > "$BACKUP_ROOT/codex-home"
+marketplace_json="$(codex plugin marketplace list --json)"
+marketplace_status="$(MARKETPLACE_JSON="$marketplace_json" python3 - "$PLUGIN_ROOT" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
 
-restore_on_error() {
-  local status=$?
-  if [[ $status -ne 0 ]]; then
-    for name in luna_worker sol_worker astra_worker; do
-      target="$CODEX_HOME/agents/$name.toml"
-      if [[ -f "$BACKUP_ROOT/agents/$name.toml.existed" ]]; then
-        cp -p "$BACKUP_ROOT/agents/$name.toml" "$target"
-      else
-        rm -f "$target"
-      fi
-    done
-    echo "Install failed; prior worker profiles were restored. Backup: $BACKUP_ROOT" >&2
-  fi
-  exit "$status"
-}
-trap restore_on_error EXIT
+desired = Path(sys.argv[1]).resolve()
+payload = json.loads(os.environ["MARKETPLACE_JSON"])
+matches = [entry for entry in payload.get("marketplaces", []) if entry.get("name") == "model-routing"]
+if not matches:
+    print("missing")
+elif len(matches) != 1:
+    print("ambiguous")
+else:
+    entry = matches[0]
+    source = entry.get("root")
+    if not source and isinstance(entry.get("marketplaceSource"), dict):
+        source = entry["marketplaceSource"].get("source")
+    try:
+        same = source is not None and Path(source).resolve() == desired
+    except OSError:
+        same = False
+    print("same" if same else "conflict:" + str(source))
+PY
+)"
 
-for name in luna_worker sol_worker astra_worker; do
-  install -m 0644 "$PLUGIN_ROOT/agents/$name.toml" "$CODEX_HOME/agents/$name.toml"
-done
+case "$marketplace_status" in
+  missing)
+    ;;
+  same)
+    ;;
+  *)
+    echo "Marketplace 'model-routing' already points elsewhere ($marketplace_status)." >&2
+    echo "Review it, then run: codex plugin marketplace remove model-routing" >&2
+    echo "After removal, run: codex plugin marketplace add '$PLUGIN_ROOT'" >&2
+    exit 2
+    ;;
+esac
 
-if ! codex plugin marketplace list 2>/dev/null | rg -q '^model-routing[[:space:]]'; then
+python3 "$REPO_ROOT/installer.py" --codex-home "$CODEX_HOME"
+if [[ "$marketplace_status" == "missing" ]]; then
   codex plugin marketplace add "$PLUGIN_ROOT"
 fi
 codex plugin add model-routing@model-routing
 
-trap - EXIT
-echo "Model Routing installed. Worker profiles are in $CODEX_HOME/agents/."
-echo "Backup: $BACKUP_ROOT"
-echo "Start a new Codex task to load the plugin skill and worker profiles."
+echo "Model Routing plugin installed. Start a new Codex task to load the refreshed policy and profiles."

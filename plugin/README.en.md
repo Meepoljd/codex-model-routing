@@ -1,45 +1,33 @@
-# Codex Model Routing Plugin
+# Adaptive Codex Model Routing Plugin
 
 [中文](README.md)
 
-Plan briefly before assigning work. Decide whether the root should handle it, one worker should own it, or several dependent tasks should be delegated. Select Luna, Sol, or Astra by risk and uncertainty. Root reports progress and integrates the evidence.
+The plugin plans and assigns work by risk and uncertainty, then delegates through native Codex `spawn_agent` roles: Luna, Sol, or Astra. A separate refresher maintains worker model IDs from the logged-in account's native `model/list` catalog. It neither reads authentication files nor sends inference requests.
 
-## Workflow
+## Routing and adaptive selection
 
-1. **Plan first:** state the outcome, acceptance criteria, known constraints, and whether a split helps. A simple task needs one sentence; planning adds no approval step.
-2. **Define boundaries and dependencies:** list each deliverable, owned paths, prerequisite results, owner, and verification evidence. Investigate unsettled interfaces first. Give shared-file edits to one worker or serialize them.
-3. **Choose tier and assign:** keep light search and summaries at root. Delegate substantive implementation to one worker when tightly coupled. Parallelize only independent work whose benefit exceeds coordination costs.
-4. **Delegate for real:** call native `spawn_agent` with the selected role and minimum necessary context. Include evidence, edits, verification, ownership, and escalation context.
-5. **Report and integrate:** workers report milestones and blockers. Root updates task status and evidence in the main conversation, waits for required results, integrates in dependency order, performs focused checks, and summarizes.
+Evaluate Astra → Sol → Luna, with higher-risk criteria taking priority:
 
-For an unknown root cause, ask Sol to investigate before assigning a bounded implementation to Luna. Do not start work that depends on findings that have not arrived.
-
-## Routing tiers
-
-Evaluate Astra → Sol → Luna, with risk taking priority.
-
-| Tier | Work |
+| Role | Work |
 | --- | --- |
-| Astra · `astra_worker` | Explicit GPT-6 Astra request; exceptionally difficult end-to-end work; interacting architectural uncertainties; or evidenced repeated Sol failures |
-| Sol · `sol_worker` | Architecture, unclear causes, high coupling or risk, concurrency/distributed systems, security-sensitive design, deep performance diagnosis, destructive migrations |
-| Luna · `luna_worker` | Routine engineering, features/refactors, API or data-model changes, test design, moderate debugging, bounded configuration fixes |
-| Root · recommended Luna low | Understanding requests, light search, summaries, planning, and coordination; this plugin does not switch the root model |
+| `astra_worker` | Explicit GPT-6/Astra selection; evidenced repeated Sol failures; interacting architectural uncertainty; exceptional cross-system complexity and failure cost beyond Sol |
+| `sol_worker` | Architecture, unclear causes, high coupling or risk, concurrency/distributed systems, security-sensitive behavior, deep performance diagnosis, destructive migrations |
+| `luna_worker` | Routine engineering, multi-file features/refactors, API/data-model changes, test design, moderate debugging, bounded configuration changes |
+| Root | Request understanding, light search, summaries, planning, coordination, and integration |
 
-Prompt length, file count, and model recency do not justify escalation. Generic GPT-6 or “use a stronger model” requests do not alone select Astra. Workers recommend escalation to Root and do not delegate further. Explain direct Astra routing and whether Sol was skipped.
+Prompt length, file count, and model recency do not justify escalation. `gpt6`, `gpt-6`, `GPT-6`, or `GPT-6 Astra` routes to Astra when the user explicitly selects it for the task. Those tokens in documentation, quotations, status history, or policy text do not trigger Astra.
 
-## Execution visibility
+The refresher recognizes only ordinary visible models whose names strictly belong to the Luna, Sol, or Astra families. It compares numeric versions, requires the role's reasoning effort, and rejects hidden, specialty, malformed, unknown-family, and explicitly tool-disabled entries. Future versions within the known families update automatically; a new unknown family is never guessed into a role.
 
-The main conversation presents the plan, observed task states, phase outputs, evidence, and final synthesis. Workers send meaningful findings, completed phases, blockers, and changed assumptions through the available parent-message tool; Root summarizes them. A wait timeout means neither failure nor completion.
+Packaged last-good defaults are Luna `gpt-6-luna`/medium, Sol `gpt-6.1-sol`/high, and Astra `gpt-6-astra`/high. The installed `~/.codex/agents/*_worker.toml` files are authoritative; do not copy model IDs from documentation.
 
-Supported clients expose worker threads; Codex CLI provides `/agent` for thread inspection. Exact controls depend on the client. See the official [Subagents documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents).
+## Workflow and visibility
 
-The plugin does not mirror every worker tool event into the main conversation or expose full private reasoning. It implements no log collection service or dashboard. See [capabilities and limits](plugins/model-routing/skills/model-routing/references/worker-visibility.md), including how this differs from the separate Agents API event stream.
+Root first states the goal, split decision, dependencies, owned paths, and verification. One suitable worker owns tightly coupled work. Parallel workers are used only for independent work whose benefit exceeds coordination cost. Handoffs include prior evidence, edits, verification, boundaries, and escalation context.
 
-## Implementation and installation
+Workers report meaningful findings, completed phases, blockers, and changed assumptions. Root presents the plan, observed state, evidence, and integrated result. Supported clients expose worker threads; the CLI provides `/agent`. The plugin does not mirror every tool event or expose private reasoning. See the [visibility reference](plugins/model-routing/skills/model-routing/references/worker-visibility.md).
 
-- `plugins/model-routing/skills/model-routing/SKILL.md`: planning, decomposition, routing, handoffs, and root reporting. Invoke it with `$model-routing`.
-- `agents/*_worker.toml`: model, reasoning effort, ownership, and progress-reporting instructions. Profiles cannot make unavailable models available.
-- `install.sh` / `uninstall.sh`: marketplace registration, skill installation, and worker backup/copy/restore.
+## Installation
 
 ```bash
 git clone git@github.com:Meepoljd/codex-model-routing.git
@@ -47,19 +35,39 @@ cd codex-model-routing/plugin
 bash install.sh
 ```
 
-Start a new Codex task after installation. The installer copies worker profiles to `~/.codex/agents/`, backing up existing files. It does not overwrite `~/.codex/AGENTS.md` or other Codex configuration.
+The installer merges a marked global routing block while preserving other AGENTS.md content. Existing root model/effort settings are explicit pins. A fresh config starts with a managed Luna/low root; a later user edit ends root management. Same-named custom worker profiles are preserved. Only missing files, the tool's last write, or exact repository legacy bytes are managed. Legacy Spark/Terra files are backed up and removed only on an exact byte match.
 
-Manual marketplace registration installs the skill but does not copy worker profiles:
+On Linux the installer attempts to enable a six-hour systemd user timer. The installed runtime under `~/.codex/model-routing/` is self-contained and does not depend on the checkout or plugin cache. Other platforms use the portable manual command. Start a new task after install or refresh; running sessions do not hot reload profiles.
+
+## Status, refresh, and troubleshooting
 
 ```bash
-codex plugin marketplace add /absolute/path/codex-model-routing/plugin
-codex plugin add model-routing@model-routing
+python3 ~/.codex/model-routing/model_router.py --codex-home ~/.codex status
+python3 ~/.codex/model-routing/model_router.py --codex-home ~/.codex refresh
 ```
 
-Run `bash uninstall.sh` from `plugin/` to uninstall. It restores workers from the latest matching backup, deletes files that were absent before installation, and leaves worker files in place if no matching backup exists. Backups are under `~/.codex/backups/model-routing-plugin-<timestamp>/`.
+`catalogSelection` reports catalog recommendations; `activeProfiles` reports effective profiles. Custom files show `managed: false`. Pagination, timeout, empty or malformed catalogs, and a missing role all fail without changing the last-good state.
 
-## Customize and verify
+```bash
+systemctl --user status codex-model-routing.timer
+systemctl --user start codex-model-routing.service
+journalctl --user -u codex-model-routing.service --since today
+```
 
-Edit `Plan before assigning` for decomposition, `Tiers` and the matching TOML files for routing, and `Visible progress and integration` plus worker instructions for reporting. Adding a worker also requires updating installer backup/copy and uninstaller restore logic. A new log UI/API requires separate implementation.
+If a marketplace with the same name points elsewhere, installation stops with inspection and repair commands instead of removing or silently replacing it. After changing plugin contents, use the official cachebuster update flow, reinstall, and validate in a new task.
 
-Check document links, TOML/JSON, and install paths. For runtime validation, use a temporary configuration and a new session to check root-only, coupled single-worker, independent multi-worker, dependency order, and actual progress delivery. State what was not tested. Do not package personal configuration, credentials, hooks, project paths, or session records.
+## Uninstall and development
+
+```bash
+bash uninstall.sh
+```
+
+Uninstall removes the plugin, disables the timer, and removes profiles and policy content still managed by this tool. User-modified and pre-existing custom profiles remain. Pre-write backups remain under `~/.codex/backups/model-routing-refresh-*`.
+
+Run repository tests with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+After skill changes, run the skill `quick_validate.py`; before delivery, run `validate_plugin.py`. Do not package personal config, credentials, hooks, project paths, or session data.

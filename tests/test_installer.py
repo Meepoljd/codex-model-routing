@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +15,16 @@ INSTALLER = ROOT / "installer.py"
 
 def run(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(INSTALLER), "--codex-home", str(home), *args],
+        [
+            sys.executable,
+            str(INSTALLER),
+            "--codex-home",
+            str(home),
+            "--no-refresh",
+            "--schedule",
+            "disable",
+            *args,
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -22,111 +32,87 @@ def run(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 class InstallerIntegrationTest(unittest.TestCase):
-    def test_fresh_install_writes_only_portable_files(self):
+    def test_fresh_install_is_self_contained_and_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
-            result = run(home)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            config = (home / "config.toml").read_text(encoding="utf-8")
-            self.assertIn('model = "gpt-5.6-luna"', config)
-            self.assertIn('[agents]\nenabled = true', config)
-            self.assertTrue((home / "AGENTS.md").is_file())
-            self.assertTrue((home / "agents" / "astra_worker.toml").is_file())
-            self.assertFalse((home / "projects").exists())
+            first = run(home)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
+            self.assertEqual(config["model"], "gpt-6-luna")
+            self.assertEqual(config["model_reasoning_effort"], "low")
+            self.assertTrue(config["agents"]["enabled"])
+            self.assertTrue((home / "model-routing" / "model_router.py").is_file())
+            self.assertTrue((home / "model-routing" / "templates" / "sol_worker.toml").is_file())
+            service = (home / "model-routing/systemd/codex-model-routing.service").read_text()
+            self.assertIn(str(home / "model-routing/model_router.py"), service)
+            self.assertNotIn(str(ROOT), service)
+            state_before = (home / "model-routing/state.json").read_text(encoding="utf-8")
 
-    def test_packaged_workers_have_documented_models_and_efforts(self):
+            second = run(home)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("Installed: no changes", second.stdout)
+            self.assertEqual((home / "model-routing/state.json").read_text(encoding="utf-8"), state_before)
+
+    def test_packaged_workers_are_three_dynamic_roles_and_plugin_copy_matches(self):
         expected = {
-            "spark_worker.toml": ("gpt-5.3-codex-spark", "low"),
-            "terra_worker.toml": ("gpt-5.6-terra", "medium"),
-            "sol_worker.toml": ("gpt-5.6-sol", "high"),
+            "luna_worker.toml": ("gpt-6-luna", "medium"),
+            "sol_worker.toml": ("gpt-6.1-sol", "high"),
             "astra_worker.toml": ("gpt-6-astra", "high"),
         }
-        for filename, (model, effort) in expected.items():
-            worker = tomllib.loads((ROOT / "agents" / filename).read_text(encoding="utf-8"))
-            self.assertEqual(worker["model"], model)
-            self.assertEqual(worker["model_reasoning_effort"], effort)
+        self.assertEqual({path.name for path in (ROOT / "agents").glob("*.toml")}, set(expected))
+        for filename, values in expected.items():
+            root_text = (ROOT / "agents" / filename).read_text(encoding="utf-8")
+            self.assertEqual(root_text, (ROOT / "plugin/agents" / filename).read_text(encoding="utf-8"))
+            worker = tomllib.loads(root_text)
+            self.assertEqual((worker["model"], worker["model_reasoning_effort"]), values)
 
-    def test_merges_config_without_losing_unrelated_sections_comments_or_multiline_value(self):
+    def test_existing_root_pin_and_unrelated_config_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
             home.mkdir()
-            original = '''# retain this comment
-model = "custom" # local preference
-model_reasoning_effort = "high"
-note = """[agents] is text, not a table
-and survives intact"""
+            original = '''# keep
+model = "gpt-6-astra" # explicit
+model_reasoning_effort = "low"
+note = """[agents] is text
+and remains text"""
 
 [plugins.example]
-enabled = false # retain too
+enabled = false
 '''
             (home / "config.toml").write_text(original, encoding="utf-8")
             result = run(home)
             self.assertEqual(result.returncode, 0, result.stderr)
             merged = (home / "config.toml").read_text(encoding="utf-8")
-            self.assertIn("# retain this comment", merged)
-            self.assertIn('model = "gpt-5.6-luna" # local preference', merged)
+            self.assertIn('model = "gpt-6-astra" # explicit', merged)
             self.assertIn('model_reasoning_effort = "low"', merged)
-            self.assertIn('note = """[agents] is text, not a table', merged)
-            self.assertIn('[plugins.example]\nenabled = false # retain too', merged)
-            self.assertIn('[agents]\nenabled = true', merged)
+            self.assertIn('[plugins.example]\nenabled = false', merged)
+            state = json.loads((home / "model-routing/state.json").read_text())
+            self.assertFalse(state["managedRoot"]["managed"])
 
-    def test_replaces_existing_policy_section_and_rerun_is_idempotent(self):
+    def test_custom_profiles_and_agents_content_survive_install_and_uninstall(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
-            home.mkdir()
+            (home / "agents").mkdir(parents=True)
+            custom = 'name = "luna_worker"\nmodel = "my-model"\nmodel_reasoning_effort = "high"\n'
+            (home / "agents/luna_worker.toml").write_text(custom, encoding="utf-8")
             (home / "AGENTS.md").write_text(
-                "# My Instructions\n\nKeep this.\n\n## Model Routing Policy\nold rules\n\n## Other\nAlso keep.\n",
+                "# Mine\n\nkeep before\n\n## Model Routing Policy\nold\n\n## Other\nkeep after\n",
                 encoding="utf-8",
             )
-            first = run(home)
-            self.assertEqual(first.returncode, 0, first.stderr)
-            document = (home / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertIn("Keep this.", document)
-            self.assertIn("## Other\nAlso keep.", document)
+            installed = run(home)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            self.assertEqual((home / "agents/luna_worker.toml").read_text(), custom)
+            document = (home / "AGENTS.md").read_text()
+            self.assertIn("keep before", document)
+            self.assertIn("## Other\nkeep after", document)
             self.assertEqual(document.count("<!-- codex-model-routing:begin -->"), 1)
-            second = run(home)
-            self.assertEqual(second.returncode, 0, second.stderr)
-            self.assertIn("Already installed; no changes.", second.stdout)
-            self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), document)
 
-    def test_multiline_text_and_array_table_are_not_treated_as_root_settings(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory) / ".codex"
-            home.mkdir()
-            (home / "config.toml").write_text(
-                '''note = """model = "not a setting"
-model_reasoning_effort = "also text"""
-[[workers]]
-model = "custom-array-value"
-''',
-                encoding="utf-8",
-            )
-            result = run(home)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            merged = (home / "config.toml").read_text(encoding="utf-8")
-            self.assertIn('model = "not a setting"', merged)
-            self.assertIn('model = "custom-array-value"', merged)
-            self.assertIn('model = "gpt-5.6-luna"', merged)
+            removed = run(home, "--uninstall")
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertEqual((home / "agents/luna_worker.toml").read_text(), custom)
+            self.assertNotIn("codex-model-routing:begin", (home / "AGENTS.md").read_text())
 
-    def test_replacing_policy_preserves_following_top_level_heading(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory) / ".codex"
-            home.mkdir()
-            (home / "AGENTS.md").write_text(
-                "## Model Routing Policy\nold\n\n# Project Instructions\nkeep\n", encoding="utf-8"
-            )
-            result = run(home)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("# Project Instructions\nkeep", (home / "AGENTS.md").read_text(encoding="utf-8"))
-
-    def test_dry_run_does_not_create_files_or_backups(self):
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory) / ".codex"
-            result = run(home, "--dry-run")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(home.exists())
-
-    def test_malformed_toml_leaves_every_target_untouched(self):
+    def test_malformed_config_is_non_destructive(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / ".codex"
             home.mkdir()
@@ -135,11 +121,67 @@ model = "custom-array-value"
             (home / "AGENTS.md").write_text("# Existing\n", encoding="utf-8")
             result = run(home)
             self.assertEqual(result.returncode, 2)
-            self.assertIn("invalid", result.stderr)
-            self.assertEqual((home / "config.toml").read_text(encoding="utf-8"), malformed)
-            self.assertEqual((home / "AGENTS.md").read_text(encoding="utf-8"), "# Existing\n")
+            self.assertEqual((home / "config.toml").read_text(), malformed)
+            self.assertEqual((home / "AGENTS.md").read_text(), "# Existing\n")
             self.assertFalse((home / "agents").exists())
-            self.assertEqual(list(home.glob("codex-model-routing-backup-*")), [])
+
+    def test_dry_run_has_no_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / ".codex"
+            result = run(home, "--dry-run")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(home.exists())
+
+    def test_symlinked_runtime_is_rejected_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / ".codex"
+            outside = root / "outside"
+            home.mkdir()
+            outside.mkdir()
+            (home / "model-routing").symlink_to(outside, target_is_directory=True)
+            result = run(home)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_custom_legacy_named_profile_is_not_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / ".codex"
+            (home / "agents").mkdir(parents=True)
+            custom = 'name = "spark_worker"\nmodel = "custom"\n'
+            (home / "agents/spark_worker.toml").write_text(custom, encoding="utf-8")
+            result = run(home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((home / "agents/spark_worker.toml").read_text(), custom)
+            self.assertIn("preserved custom legacy-named profile", result.stderr)
+
+    def test_exact_repository_legacy_profiles_are_backed_up_and_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / ".codex"
+            (home / "agents").mkdir(parents=True)
+            for role in ("spark", "terra"):
+                fixture = ROOT / f"tests/fixtures/legacy_{role}_worker.toml"
+                (home / f"agents/{role}_worker.toml").write_text(fixture.read_text())
+            result = run(home)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((home / "agents/spark_worker.toml").exists())
+            self.assertFalse((home / "agents/terra_worker.toml").exists())
+            backups = list((home / "backups").glob("model-routing-refresh-*"))
+            self.assertTrue(backups)
+            self.assertTrue(any((backup / "agents/spark_worker.toml").is_file() for backup in backups))
+
+    def test_uninstall_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / ".codex"
+            self.assertEqual(run(home).returncode, 0)
+            first = run(home, "--uninstall")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertFalse((home / "config.toml").exists())
+            self.assertFalse((home / "AGENTS.md").exists())
+            self.assertFalse((home / "model-routing").exists())
+            second = run(home, "--uninstall")
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("no changes", second.stdout)
 
 
 if __name__ == "__main__":

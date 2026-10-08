@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the portable Codex model-routing policy without replacing local settings."""
+"""Install, refresh, or uninstall adaptive Codex model routing."""
 
 from __future__ import annotations
 
@@ -7,20 +7,66 @@ import argparse
 import copy
 import json
 import os
-from datetime import datetime, timezone
 from pathlib import Path
+import re
 import shutil
+import subprocess
 import sys
-import tempfile
 import tomllib
+from typing import Any
+
+from model_router import (
+    MANAGED_ROOT_MARKER,
+    ROLES,
+    RoutingError,
+    STATE_VERSION,
+    read_state,
+    refresh,
+    routing_lock,
+    profile_selection,
+    sha256_text,
+    transactional_write,
+    utc_now,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 POLICY_FILE = ROOT / "policy" / "model-routing-policy.md"
-WORKERS = ("spark_worker.toml", "terra_worker.toml", "sol_worker.toml", "astra_worker.toml")
+ENGINE_FILE = ROOT / "model_router.py"
+WORKERS = tuple(f"{role}.toml" for role in ROLES)
 START = "<!-- codex-model-routing:begin -->"
 END = "<!-- codex-model-routing:end -->"
-DEFAULT_CONFIG = 'model = "gpt-5.6-luna"\nmodel_reasoning_effort = "low"\n\n[agents]\nenabled = true\n'
+DEFAULT_SELECTIONS = {
+    "luna_worker": {"model": "gpt-6-luna", "effort": "medium"},
+    "sol_worker": {"model": "gpt-6.1-sol", "effort": "high"},
+    "astra_worker": {"model": "gpt-6-astra", "effort": "high"},
+    "root": {"model": "gpt-6-luna", "effort": "low"},
+}
+DEFAULT_CONFIG = (
+    f"{MANAGED_ROOT_MARKER}\n"
+    'model = "gpt-6-luna"\n'
+    'model_reasoning_effort = "low"\n\n'
+    "[agents]\n"
+    "enabled = true\n"
+)
+
+# Exact repository-managed files from pre-adaptive releases. Same-named custom
+# profiles are never migrated or overwritten unless their bytes match a hash.
+KNOWN_MANAGED_PROFILE_HASHES = {
+    "luna_worker": {"d4f1f3422aa2d93356bf66e24b67a151c2ae04d9815ee37ff04f114e909897c7"},
+    "sol_worker": {
+        "d2e8281f573a9694588723cd0acccdd4e85fb772cb17d1ef84e5c991e5a11ca7",
+        "43074c9c89489874b451e1908a8036ab89db6d41d85502dbe3e822395e81d0f3",
+    },
+    "astra_worker": {
+        "0f8675ce1bb54cdab6bf5221fef25b4e40ad7e220483f782f8e02d9832cc74fe",
+        "8f07469e812fb5953d1cca1eee655f1a65f8ab0400b6f703e7356eaf7bbad0c7",
+    },
+}
+LEGACY_REMOVALS = {
+    "spark_worker.toml": "7df5f18540776579ec50e5e251ed1d7883c7ab7f22b95416d27c3e2628446e8d",
+    "terra_worker.toml": "cdf695ff6dd349ebe198e036678115562c42224e15720eb2b6b4ed9ed011ce11",
+}
 
 
 class InstallError(RuntimeError):
@@ -29,48 +75,57 @@ class InstallError(RuntimeError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
-    parser.add_argument("--dry-run", action="store_true", help="Validate and report changes without writing files.")
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")),
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Install packaged last-good defaults without querying model/list.",
+    )
+    parser.add_argument("--schedule", choices=("auto", "enable", "disable"), default="auto")
+    parser.add_argument("--uninstall", action="store_true")
     return parser.parse_args()
 
 
 def validate_package() -> None:
-    if not POLICY_FILE.is_file():
-        raise InstallError(f"Missing packaged policy: {POLICY_FILE}")
+    for path in (POLICY_FILE, ENGINE_FILE):
+        if not path.is_file():
+            raise InstallError(f"Missing packaged file: {path}")
     for worker in WORKERS:
         source = ROOT / "agents" / worker
         if not source.is_file():
             raise InstallError(f"Missing packaged worker: {source}")
-        tomllib.loads(source.read_text(encoding="utf-8"))
+        data = tomllib.loads(source.read_text(encoding="utf-8"))
+        if data.get("name") != worker.removesuffix(".toml"):
+            raise InstallError(f"Worker name does not match file: {source}")
 
 
 def table_spans(text: str) -> list[tuple[int, str, bool]]:
-    """Find TOML table headers outside multiline basic/literal strings.
-
-    tomllib validates syntax first. This small scanner is intentionally limited to
-    locating table boundaries, so comments and unrelated source text are retained.
-    """
     spans: list[tuple[int, str, bool]] = []
     delimiter: str | None = None
     offset = 0
     for line in text.splitlines(keepends=True):
-        i = 0
+        index = 0
         quote = delimiter
-        while i < len(line):
+        while index < len(line):
             if quote:
-                if line.startswith(quote, i):
+                if line.startswith(quote, index):
                     quote = None
-                    i += 3
+                    index += 3
                 else:
-                    i += 1
+                    index += 1
                 continue
-            if line.startswith('"""', i) or line.startswith("'''", i):
-                quote = line[i : i + 3]
-                i += 3
+            if line.startswith('"""', index) or line.startswith("'''", index):
+                quote = line[index : index + 3]
+                index += 3
                 continue
-            if line[i] == "#":
+            if line[index] == "#":
                 break
-            i += 1
+            index += 1
         if delimiter is None and quote is None:
             stripped = line.lstrip()
             if stripped.startswith("["):
@@ -80,7 +135,7 @@ def table_spans(text: str) -> list[tuple[int, str, bool]]:
                 if close > 1:
                     name = stripped[2:close].strip() if array else stripped[1:close].strip()
                     trailer = stripped[close + len(close_token) :].strip()
-                    if trailer == "" or trailer.startswith("#"):
+                    if not trailer or trailer.startswith("#"):
                         spans.append((offset, name, array))
         delimiter = quote
         offset += len(line)
@@ -88,13 +143,11 @@ def table_spans(text: str) -> list[tuple[int, str, bool]]:
 
 
 def replace_key_in_region(region: str, key: str, value: str) -> tuple[str, bool]:
-    """Replace an exact bare key assignment while preserving line comments."""
     lines = region.splitlines(keepends=True)
     delimiter: str | None = None
     for index, line in enumerate(lines):
         if delimiter is not None:
-            close = line.find(delimiter)
-            if close >= 0:
+            if delimiter in line:
                 delimiter = None
             continue
         stripped = line.lstrip()
@@ -108,40 +161,35 @@ def replace_key_in_region(region: str, key: str, value: str) -> tuple[str, bool]
         if not rest.lstrip().startswith("="):
             continue
         prefix = line[: len(line) - len(stripped)]
-        comment_index = rest.find("#")
-        comment = "" if comment_index < 0 else " " + rest[comment_index:].rstrip("\r\n")
+        comment_at = rest.find("#")
+        comment = "" if comment_at < 0 else " " + rest[comment_at:].rstrip("\r\n")
         newline = "\n" if line.endswith("\n") else ""
         lines[index] = f"{prefix}{key} = {value}{comment}{newline}"
         return "".join(lines), True
     return region, False
 
 
-def merge_config(existing: str | None) -> str:
+def merge_config(existing: str | None) -> tuple[str, dict[str, Any]]:
     if existing is None:
-        return DEFAULT_CONFIG
+        return DEFAULT_CONFIG, {"managed": True, **DEFAULT_SELECTIONS["root"]}
     try:
-        original_data = tomllib.loads(existing)
+        original = tomllib.loads(existing)
     except tomllib.TOMLDecodeError as exc:
         raise InstallError(f"Existing config.toml is invalid; no files changed: {exc}") from exc
-
     spans = table_spans(existing)
     first_table = spans[0][0] if spans else len(existing)
     root, tail = existing[:first_table], existing[first_table:]
-    for key, value in (("model", '"gpt-5.6-luna"'), ("model_reasoning_effort", '"low"')):
-        root, found = replace_key_in_region(root, key, value)
-        if not found:
-            if root and not root.endswith("\n"):
-                root += "\n"
-            root += f"{key} = {value}\n"
-
-    agents = next(((pos, name) for pos, name, array in spans if name == "agents" and not array), None)
+    agents = next(
+        ((position, name) for position, name, array in spans if name == "agents" and not array),
+        None,
+    )
     if agents is None:
         if tail and not tail.endswith("\n"):
             tail += "\n"
         tail += "\n[agents]\nenabled = true\n"
     else:
         start = agents[0] - first_table
-        following = [pos - first_table for pos, _, _ in spans if pos > agents[0]]
+        following = [position - first_table for position, _, _ in spans if position > agents[0]]
         end = following[0] if following else len(tail)
         region, found = replace_key_in_region(tail[start:end], "enabled", "true")
         if not found:
@@ -150,13 +198,8 @@ def merge_config(existing: str | None) -> str:
             region += "enabled = true\n"
         tail = tail[:start] + region + tail[end:]
     result = root + tail
-    try:
-        result_data = tomllib.loads(result)
-    except tomllib.TOMLDecodeError as exc:
-        raise InstallError(f"Refusing generated invalid config.toml: {exc}") from exc
-    expected = copy.deepcopy(original_data)
-    expected["model"] = "gpt-5.6-luna"
-    expected["model_reasoning_effort"] = "low"
+    rendered = tomllib.loads(result)
+    expected = copy.deepcopy(original)
     agents_data = expected.get("agents")
     if agents_data is None:
         expected["agents"] = {"enabled": True}
@@ -164,9 +207,9 @@ def merge_config(existing: str | None) -> str:
         raise InstallError("Existing agents value is not a TOML table; no files changed.")
     else:
         agents_data["enabled"] = True
-    if result_data != expected:
+    if rendered != expected:
         raise InstallError("Unsupported TOML layout would change unrelated semantics; no files changed.")
-    return result
+    return result, {"managed": False, "reason": "pre-existing-config"}
 
 
 def merge_agents(existing: str | None) -> str:
@@ -176,18 +219,25 @@ def merge_agents(existing: str | None) -> str:
         return managed
     if START in existing or END in existing:
         if existing.count(START) != 1 or existing.count(END) != 1:
-            raise InstallError("AGENTS.md has ambiguous existing managed routing markers; no files changed.")
+            raise InstallError("AGENTS.md has ambiguous routing markers; no files changed.")
         start = existing.index(START)
         end = existing.index(END, start) + len(END)
         return existing[:start] + managed.rstrip("\n") + existing[end:]
     lines = existing.splitlines(keepends=True)
-    header = next((i for i, line in enumerate(lines) if line.rstrip("\r\n") == "## Model Routing Policy"), None)
-    if header is not None:
+    heading = next(
+        (index for index, line in enumerate(lines) if line.rstrip("\r\n") == "## Model Routing Policy"),
+        None,
+    )
+    if heading is not None:
         end = next(
-            (i for i in range(header + 1, len(lines)) if lines[i].startswith("# ") or lines[i].startswith("## ")),
+            (
+                index
+                for index in range(heading + 1, len(lines))
+                if lines[index].startswith("# ") or lines[index].startswith("## ")
+            ),
             len(lines),
         )
-        return "".join(lines[:header]) + managed + "".join(lines[end:])
+        return "".join(lines[:heading]) + managed + "".join(lines[end:])
     suffix = "" if existing.endswith("\n") else "\n"
     return existing + suffix + "\n" + managed
 
@@ -199,86 +249,377 @@ def checked_file(path: Path) -> None:
         raise InstallError(f"Expected a file but found another path type: {path}")
 
 
-def atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+def _initial_state(
+    home: Path,
+    root_state: dict[str, Any],
+    *,
+    config_created: bool,
+    agents_created: bool,
+) -> dict[str, Any]:
+    existing = read_state(home)
+    if existing is not None:
+        return existing
+    return {
+        "version": STATE_VERSION,
+        "installedAt": utc_now().isoformat(),
+        "lastSuccessAt": None,
+        "catalogSelection": DEFAULT_SELECTIONS,
+        "activeProfiles": {
+            role: {"managed": True, **selection}
+            for role, selection in DEFAULT_SELECTIONS.items()
+            if role != "root"
+        },
+        "managedProfiles": {},
+        "managedRoot": root_state,
+        "configCreated": config_created,
+        "agentsCreated": agents_created,
+    }
+
+
+def _profile_is_managed(path: Path, role: str, state: dict[str, Any]) -> bool:
+    if not path.exists():
+        return True
+    digest = sha256_text(path.read_text(encoding="utf-8"))
+    record = state.get("managedProfiles", {}).get(role)
+    if isinstance(record, dict) and record.get("managed") is True and record.get("sha256") == digest:
+        return True
+    return digest in KNOWN_MANAGED_PROFILE_HASHES.get(role, set())
+
+
+def _systemd_units(home: Path, codex_executable: str | None) -> dict[Path, str]:
+    runtime = home / "model-routing"
+    script = str(runtime / "model_router.py").replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
+    codex_home = str(home).replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
+    codex_dir = str(Path(codex_executable).parent) if codex_executable else ""
+    service_path = os.pathsep.join(part for part in (codex_dir, "/usr/local/bin", "/usr/bin", "/bin") if part)
+    service_path = service_path.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
+    service = f'''[Unit]
+Description=Refresh adaptive Codex model routing
+
+[Service]
+Type=oneshot
+Environment="PATH={service_path}"
+ExecStart=/usr/bin/env python3 "{script}" --codex-home "{codex_home}" refresh --if-stale
+'''
+    timer = '''[Unit]
+Description=Refresh adaptive Codex model routing periodically
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=6h
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+'''
+    return {
+        runtime / "systemd" / "codex-model-routing.service": service,
+        runtime / "systemd" / "codex-model-routing.timer": timer,
+    }
+
+
+def _systemd_available() -> bool:
+    return sys.platform.startswith("linux") and shutil.which("systemctl") is not None
+
+
+def enable_timer(home: Path, *, required: bool) -> str | None:
+    if not _systemd_available():
+        if required:
+            raise InstallError("systemd user services are unavailable; use model-router refresh manually")
+        return "systemd unavailable; use the portable refresh command"
+    units = home / "model-routing" / "systemd"
+    commands = (
+        [
+            "systemctl",
+            "--user",
+            "link",
+            "--force",
+            str(units / "codex-model-routing.service"),
+            str(units / "codex-model-routing.timer"),
+        ],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", "codex-model-routing.timer"],
+    )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(content)
-        os.replace(name, path)
-    except BaseException:
-        Path(name).unlink(missing_ok=True)
-        raise
+        for command in commands:
+            subprocess.run(command, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as exc:
+        if required:
+            raise InstallError(f"could not enable systemd timer: {exc.stderr.strip()}") from exc
+        return f"could not enable systemd timer: {exc.stderr.strip()}"
+    return None
 
 
-def make_backup(home: Path, changes: dict[Path, str]) -> Path:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = home / f"codex-model-routing-backup-{stamp}"
-    number = 1
-    while backup.exists():
-        backup = home / f"codex-model-routing-backup-{stamp}-{number}"
-        number += 1
-    backup.mkdir(parents=True)
-    manifest: dict[str, str | None] = {}
-    for path in changes:
-        relative = str(path.relative_to(home))
-        if path.exists():
-            destination = backup / path.relative_to(home)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
-            manifest[relative] = relative
-        else:
-            manifest[relative] = None
-    (backup / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    return backup
+def disable_timer() -> None:
+    if not _systemd_available():
+        return
+    subprocess.run(
+        ["systemctl", "--user", "disable", "--now", "codex-model-routing.timer"],
+        check=False,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["systemctl", "--user", "daemon-reload"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
-def install(home: Path, dry_run: bool) -> tuple[list[Path], Path | None]:
+def _install_files(
+    home: Path,
+    *,
+    dry_run: bool,
+    no_refresh: bool,
+    schedule: str,
+) -> tuple[list[Path], Path | None, list[str]]:
     validate_package()
+    home = home.expanduser().absolute()
     if home.exists() and (home.is_symlink() or not home.is_dir()):
         raise InstallError(f"Codex home must be a real directory: {home}")
+    if not dry_run:
+        home.mkdir(parents=True, exist_ok=True)
     config = home / "config.toml"
     agents_doc = home / "AGENTS.md"
     agents_dir = home / "agents"
-    if agents_dir.is_symlink():
-        raise InstallError(f"Refusing symbolic-link directory: {agents_dir}")
-    if agents_dir.exists() and not agents_dir.is_dir():
-        raise InstallError(f"Expected an agents directory but found another path type: {agents_dir}")
-    targets = [config, agents_doc, *(home / "agents" / worker for worker in WORKERS)]
+    if agents_dir.is_symlink() or (agents_dir.exists() and not agents_dir.is_dir()):
+        raise InstallError(f"Agents path must be a real directory: {agents_dir}")
+    for directory, label in (
+        (home / "model-routing", "model-routing runtime"),
+        (home / "backups", "backup directory"),
+    ):
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise InstallError(f"{label} must be a real directory: {directory}")
+    targets = (
+        config,
+        agents_doc,
+        *(agents_dir / worker for worker in WORKERS),
+        *(agents_dir / name for name in LEGACY_REMOVALS),
+    )
     for target in targets:
         checked_file(target)
     config_text = config.read_text(encoding="utf-8") if config.exists() else None
     agents_text = agents_doc.read_text(encoding="utf-8") if agents_doc.exists() else None
-    desired: dict[Path, str] = {config: merge_config(config_text), agents_doc: merge_agents(agents_text)}
-    desired.update({home / "agents" / worker: (ROOT / "agents" / worker).read_text(encoding="utf-8") for worker in WORKERS})
-    changes = {path: content for path, content in desired.items() if not path.exists() or path.read_text(encoding="utf-8") != content}
-    if dry_run or not changes:
-        return list(changes), None
+    merged_config, root_state = merge_config(config_text)
+    state = _initial_state(
+        home,
+        root_state,
+        config_created=config_text is None,
+        agents_created=agents_text is None,
+    )
+    desired: dict[Path, str | None] = {
+        config: merged_config,
+        agents_doc: merge_agents(agents_text),
+        home / "model-routing" / "model_router.py": ENGINE_FILE.read_text(encoding="utf-8"),
+        **_systemd_units(home, shutil.which("codex")),
+    }
+    warnings: list[str] = []
+    managed_profiles = dict(state.get("managedProfiles", {}))
+    selections = (
+        state.get("catalogSelection")
+        if isinstance(state.get("catalogSelection"), dict)
+        else DEFAULT_SELECTIONS
+    )
+    active_profiles = dict(state.get("activeProfiles", {}))
+    for worker in WORKERS:
+        role = worker.removesuffix(".toml")
+        source = ROOT / "agents" / worker
+        template = source.read_text(encoding="utf-8")
+        desired[home / "model-routing" / "templates" / worker] = template
+        target = agents_dir / worker
+        if _profile_is_managed(target, role, state):
+            selection = selections.get(role, DEFAULT_SELECTIONS[role])
+            rendered = re.sub(
+                r'(?m)^model\s*=\s*"[^"]+"\s*$',
+                f'model = "{selection["model"]}"',
+                template,
+                count=1,
+            )
+            rendered = re.sub(
+                r'(?m)^model_reasoning_effort\s*=\s*"[^"]+"\s*$',
+                f'model_reasoning_effort = "{selection["effort"]}"',
+                rendered,
+                count=1,
+            )
+            desired[target] = rendered
+            managed_profiles[role] = {"managed": True, "sha256": sha256_text(rendered)}
+            active_profiles[role] = {"managed": True, **selection}
+        else:
+            warnings.append(f"preserved custom profile {target}")
+            managed_profiles[role] = {
+                "managed": False,
+                "reason": "pre-existing-custom-profile",
+            }
+            active_profiles[role] = profile_selection(target)
+    for name, digest in LEGACY_REMOVALS.items():
+        target = agents_dir / name
+        if target.exists() and sha256_text(target.read_text(encoding="utf-8")) == digest:
+            desired[target] = None
+        elif target.exists():
+            warnings.append(f"preserved custom legacy-named profile {target}")
+    state["managedProfiles"] = managed_profiles
+    state["activeProfiles"] = active_profiles
+    if not isinstance(state.get("managedRoot"), dict):
+        state["managedRoot"] = root_state
+    state_path = home / "model-routing" / "state.json"
+    desired[state_path] = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    changes = [
+        path
+        for path, content in desired.items()
+        if (content is None and path.exists())
+        or (
+            content is not None
+            and (not path.exists() or path.read_text(encoding="utf-8") != content)
+        )
+    ]
+    if dry_run:
+        return changes, None, warnings
+    backup = transactional_write(home, desired)
+    return changes, backup, warnings
+
+
+def install(
+    home: Path,
+    *,
+    dry_run: bool,
+    no_refresh: bool,
+    schedule: str,
+) -> tuple[list[Path], Path | None, list[str]]:
+    home = home.expanduser().absolute()
+    if dry_run:
+        return _install_files(home, dry_run=True, no_refresh=True, schedule=schedule)
     home.mkdir(parents=True, exist_ok=True)
-    backup = make_backup(home, changes)
-    try:
-        for path, content in changes.items():
-            atomic_write(path, content)
-    except BaseException:
-        # Backups remain available for manual recovery if an external filesystem error occurs.
-        raise
-    return list(changes), backup
+    with routing_lock(home):
+        changes, backup, warnings = _install_files(
+            home, dry_run=False, no_refresh=True, schedule=schedule
+        )
+    if not no_refresh:
+        try:
+            refresh(home, home / "model-routing" / "templates")
+        except (RoutingError, OSError, tomllib.TOMLDecodeError) as exc:
+            warnings.append(
+                f"catalog refresh deferred; packaged last-good routing remains active: {exc}"
+            )
+    expected_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().absolute()
+    should_enable = schedule == "enable" or (schedule == "auto" and home == expected_home)
+    if should_enable:
+        warning = enable_timer(home, required=schedule == "enable")
+        if warning:
+            warnings.append(warning)
+    return changes, backup, warnings
+
+
+def _remove_managed_agents_block(text: str) -> str:
+    if text.count(START) == 1 and text.count(END) == 1:
+        start = text.index(START)
+        end = text.index(END, start) + len(END)
+        before, after = text[:start].rstrip(), text[end:].lstrip("\n")
+        return ((before + "\n\n") if before and after else before) + after
+    return text
+
+
+def _uninstall_files(home: Path, *, dry_run: bool) -> tuple[list[Path], Path | None]:
+    home = home.expanduser().absolute()
+    state = read_state(home)
+    if state is None:
+        return [], None
+    desired: dict[Path, str | None] = {}
+    agents_doc = home / "AGENTS.md"
+    if agents_doc.exists():
+        agents_text = agents_doc.read_text(encoding="utf-8")
+        without_policy = _remove_managed_agents_block(agents_text)
+        desired[agents_doc] = (
+            None if state.get("agentsCreated") is True and not without_policy.strip() else without_policy
+        )
+    managed = state.get("managedProfiles", {})
+    for role in ROLES:
+        target = home / "agents" / f"{role}.toml"
+        record = managed.get(role) if isinstance(managed, dict) else None
+        if target.exists() and isinstance(record, dict) and record.get("managed") is True:
+            if sha256_text(target.read_text(encoding="utf-8")) == record.get("sha256"):
+                desired[target] = None
+    config = home / "config.toml"
+    root = state.get("managedRoot")
+    if config.exists() and isinstance(root, dict) and root.get("managed") is True:
+        text = config.read_text(encoding="utf-8")
+        parsed = tomllib.loads(text)
+        if (
+            parsed.get("model") == root.get("model")
+            and parsed.get("model_reasoning_effort") == root.get("effort")
+        ):
+            clean = text.replace(MANAGED_ROOT_MARKER + "\n", "", 1)
+            expected = {
+                "model": root.get("model"),
+                "model_reasoning_effort": root.get("effort"),
+                "agents": {"enabled": True},
+            }
+            desired[config] = (
+                None
+                if state.get("configCreated") is True and tomllib.loads(clean) == expected
+                else clean
+            )
+    runtime = home / "model-routing"
+    if runtime.exists():
+        for path in sorted(runtime.rglob("*"), reverse=True):
+            if path.is_file():
+                desired[path] = None
+    changes = [
+        path
+        for path, value in desired.items()
+        if path.exists() and (value is None or path.read_text(encoding="utf-8") != value)
+    ]
+    if dry_run:
+        return changes, None
+    backup = transactional_write(home, desired)
+    for directory in (runtime / "templates", runtime / "systemd", runtime):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return changes, backup
+
+
+def uninstall(home: Path, *, dry_run: bool) -> tuple[list[Path], Path | None]:
+    home = home.expanduser().absolute()
+    if dry_run:
+        return _uninstall_files(home, dry_run=True)
+    disable_timer()
+    with routing_lock(home):
+        return _uninstall_files(home, dry_run=False)
 
 
 def main() -> int:
     args = parse_args()
     try:
-        changes, backup = install(args.codex_home.expanduser().absolute(), args.dry_run)
-    except InstallError as exc:
+        if args.uninstall:
+            changes, backup = uninstall(args.codex_home, dry_run=args.dry_run)
+            warnings: list[str] = []
+        else:
+            changes, backup, warnings = install(
+                args.codex_home,
+                dry_run=args.dry_run,
+                no_refresh=args.no_refresh or args.dry_run,
+                schedule=args.schedule,
+            )
+    except (InstallError, RoutingError, OSError, tomllib.TOMLDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if args.dry_run:
-        print("Dry run: " + (", ".join(str(path) for path in changes) if changes else "no changes"))
-    elif changes:
-        print("Installed: " + ", ".join(str(path) for path in changes))
+    verb = "Would change" if args.dry_run else ("Uninstalled" if args.uninstall else "Installed")
+    print(f"{verb}: " + (", ".join(str(path) for path in changes) if changes else "no changes"))
+    if backup:
         print(f"Backup: {backup}")
-    else:
-        print("Already installed; no changes.")
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    if not args.uninstall and not args.dry_run:
+        home = args.codex_home.expanduser().absolute()
+        print(
+            "Refresh manually: "
+            f"python3 {home / 'model-routing/model_router.py'} --codex-home {home} refresh"
+        )
+        print("Start a new Codex task to load refreshed profiles and policy.")
     return 0
 
 

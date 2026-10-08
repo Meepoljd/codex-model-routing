@@ -5,7 +5,9 @@ description: Plan task boundaries and dependencies, choose the lowest-cost Codex
 
 # Model Routing
 
-This is a prompt-driven workflow, not a runtime router. Preserve the user's scope and explicit model, delegation, and analysis-only instructions. Policy or TOML edits do not change the model of a running session.
+This skill applies the routing workflow. A separate installed refresher maintains the worker profiles from the logged-in Codex `model/list` catalog without making inference calls. Preserve the user's scope and explicit model, delegation, and analysis-only instructions. Profile changes take effect in a new task and do not change a running session.
+
+Before routing, use the current `luna_worker`, `sol_worker`, and `astra_worker` profiles in the Codex agents directory as the source of model IDs. When exact status matters, run the installed `model_router.py ... status` command documented by this package and distinguish `catalogSelection` from `activeProfiles`. Do not copy a model ID from this skill. The refresher recognizes future numeric versions only within the known Luna, Sol, and Astra families; it conservatively ignores unknown families, hidden or specialty entries, unsupported reasoning efforts, and explicit tool-capability failures.
 
 ## Plan before assigning
 
@@ -23,10 +25,10 @@ For each delegated task record an ID, deliverable, absolute paths (or no files),
 
 Route each task by type, ambiguity, coupling, risk, verifiability, and root-cause uncertainty. Evaluate Astra, then Sol, then Luna; high-risk rules take priority. Do not use prompt length or file count as proxies. Judge coupled risks together rather than splitting a risky task into apparently routine pieces.
 
-1. **Astra (`gpt-6-astra`, `astra_worker`):** an explicit request for GPT-6 Astra; the hardest end-to-end engineering; multiple interacting architectural uncertainties; evidenced repeated Sol failures; exceptional cross-system complexity and failure cost making Sol likely insufficient; or extremely complex synthesis/implementation. Generic “GPT-6” or “a stronger model” requests do not alone select Astra. Quoted model names are not user requests. Ordinary architecture, security, and concurrency stay at Sol.
-2. **Sol (`gpt-6-sol`, `sol_worker`):** architecture; unclear root cause; high ambiguity, coupling, or risk; concurrency, deadlocks, lock ordering, cancellation safety, distributed coordination; security-sensitive design or critical behavior; deep performance diagnosis; destructive migrations; or repeated Luna failures.
-3. **Luna (`gpt-6-luna`, `luna_worker`):** routine engineering, multi-file features/refactors, API/data-model changes, test design, moderate debugging, bounded configuration fixes, and cross-module analysis without architectural uncertainty or high risk.
-4. **Root on Luna (`gpt-6-luna`, low):** the light coordination work described above. This is the recommended default, not a model switch performed by this skill. Delegate substantial implementation and route analysis by its actual difficulty.
+1. **Astra (`astra_worker`):** an explicit task selection of `gpt6`, `gpt-6`, `GPT-6`, `GPT-6 Astra`, or the active Astra-family model; the hardest end-to-end engineering; multiple interacting architectural uncertainties; evidenced repeated Sol failures; exceptional cross-system complexity and failure cost making Sol likely insufficient; or extremely complex synthesis/implementation. Tokens in quoted text, policy, documentation, status history, or rationale are not user model selections. Ordinary architecture, security, and concurrency stay at Sol.
+2. **Sol (`sol_worker`):** architecture; unclear root cause; high ambiguity, coupling, or risk; concurrency, deadlocks, lock ordering, cancellation safety, distributed coordination; security-sensitive design or critical behavior; deep performance diagnosis; destructive migrations; or repeated Luna failures.
+3. **Luna (`luna_worker`):** routine engineering, multi-file features/refactors, API/data-model changes, test design, moderate debugging, bounded configuration fixes, and cross-module analysis without architectural uncertainty or high risk.
+4. **Root:** the light coordination work described above. A fresh managed install starts on the current Luna-family model at low reasoning, while existing root selections remain explicit pins. Delegate substantial implementation and route analysis by its actual difficulty.
 
 ## Handoff and native execution
 
@@ -69,4 +71,4 @@ Workers return recommendations; root revises the plan and decides escalation. St
 
 Astra handoffs must contain Sol attempts, evidence, failure reasons, and unresolved questions. When direct routing is justified by an explicit Astra request or exceptional criteria, state that no Sol attempt occurred and explain why. Never fabricate attempts, repeat a failed approach without a new hypothesis, or enlarge scope because the model is stronger.
 
-TOML profiles cannot make unavailable models available. Follow the active runtime's supported mechanisms and disclose unavailable roles/models. Start a new Codex task after installing or changing this plugin. Project instructions and explicit user directions may override this policy.
+TOML profiles cannot make unavailable models available. Discovery failures keep the last-good profiles, and a user-modified or pre-existing custom profile stays unmanaged until the user explicitly replaces it. Follow the active runtime's supported mechanisms and disclose unavailable roles/models. Start a new Codex task after installing or refreshing this plugin. Project instructions and explicit user directions may override this policy.

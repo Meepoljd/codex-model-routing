@@ -1,36 +1,42 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
+PLUGIN_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$PLUGIN_ROOT/.." && pwd)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-if ! command -v codex >/dev/null 2>&1; then
-  echo "codex CLI was not found on PATH." >&2
-  exit 1
-fi
+export CODEX_HOME
 
-codex plugin remove model-routing@model-routing 2>/dev/null || true
-codex plugin marketplace remove model-routing 2>/dev/null || true
+if command -v codex >/dev/null 2>&1; then
+  marketplace_json="$(codex plugin marketplace list --json)"
+  marketplace_status="$(MARKETPLACE_JSON="$marketplace_json" python3 - "$PLUGIN_ROOT" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
 
-backup_root=""
-for candidate in "$CODEX_HOME"/backups/model-routing-plugin-*; do
-  [[ -d "$candidate" ]] || continue
-  [[ -f "$candidate/codex-home" ]] || continue
-  if [[ "$(<"$candidate/codex-home")" == "$CODEX_HOME" ]]; then
-    backup_root="$candidate"
-  fi
-done
-
-if [[ -z "$backup_root" ]]; then
-  echo "Plugin removed. No matching installer backup was found; worker files were left in place."
-  exit 0
-fi
-
-for name in luna_worker sol_worker astra_worker; do
-  target="$CODEX_HOME/agents/$name.toml"
-  if [[ -f "$backup_root/agents/$name.toml.existed" ]]; then
-    cp -p "$backup_root/agents/$name.toml" "$target"
+desired = Path(sys.argv[1]).resolve()
+payload = json.loads(os.environ["MARKETPLACE_JSON"])
+matches = [entry for entry in payload.get("marketplaces", []) if entry.get("name") == "model-routing"]
+if len(matches) != 1:
+    print("missing-or-ambiguous")
+else:
+    entry = matches[0]
+    source = entry.get("root")
+    if not source and isinstance(entry.get("marketplaceSource"), dict):
+        source = entry["marketplaceSource"].get("source")
+    try:
+        print("same" if source is not None and Path(source).resolve() == desired else "different")
+    except OSError:
+        print("different")
+PY
+)"
+  if [[ "$marketplace_status" == "same" ]]; then
+    codex plugin remove model-routing@model-routing 2>/dev/null || true
+    codex plugin marketplace remove model-routing
   else
-    rm -f "$target"
+    echo "Marketplace 'model-routing' is absent, ambiguous, or points elsewhere; leaving plugin registry unchanged." >&2
   fi
-done
+fi
 
-echo "Plugin removed and worker profiles restored from $backup_root."
+python3 "$REPO_ROOT/installer.py" --codex-home "$CODEX_HOME" --uninstall
+echo "Model Routing plugin and managed runtime removed. Backups remain under $CODEX_HOME/backups/."

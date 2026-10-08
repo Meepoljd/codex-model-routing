@@ -1,7 +1,7 @@
 {
   "name": "model-routing",
-  "version": "1.0.0",
-  "description": "Route Codex work to the least costly model likely to complete it correctly, with evidence-based escalation and native worker delegation.",
+  "version": "1.0.0+codex.20261008081636",
+  "description": "Route Codex work through catalog-adaptive Luna, Sol, and Astra workers with evidence-based escalation.",
   "author": {
     "name": "Local Model Routing"
   },
@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "Model Routing",
     "shortDescription": "Choose a model by task risk and complexity.",
-    "longDescription": "Provides a portable Codex routing policy, Luna/Sol/Astra worker profiles, and one-command install and uninstall scripts.",
+    "longDescription": "Provides a portable routing policy and Luna/Sol/Astra worker profiles whose known model families refresh from the logged-in Codex catalog.",
     "developerName": "Local Model Routing",
     "category": "Developer Tools",
     "capabilities": [
